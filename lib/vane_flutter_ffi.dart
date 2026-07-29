@@ -161,6 +161,11 @@ final class _VaneFfiResponse extends Struct {
   @Bool()
   external bool isSuccess;
 
+  /// `VaneError::ffi_kind` for [error]; 0 when there is no error. Declared here
+  /// because Rust puts it here, in the padding after `is_success`.
+  @Uint32()
+  external int errorKind;
+
   external _VaneFfiHeaderArray headers;
   external _VaneFfiBuffer body;
   external _VaneFfiBuffer bodyFilePath;
@@ -674,7 +679,7 @@ class _VaneFfiBindings {
       final response = pointer.ref;
       final error = _readString(response.error);
       if (error.isNotEmpty) {
-        throw VaneHttpException(error);
+        throw VaneHttpException(error, kind: _errorKind(response.errorKind));
       }
       final headers = _readHeaders(response.headers);
       final bodyFilePath = _readString(response.bodyFilePath);
@@ -875,6 +880,13 @@ Map<String, String> _readHeaders(_VaneFfiHeaderArray headers) {
   }
   return map;
 }
+
+/// Ordinals are the ABI contract with `VaneError::ffi_kind`. A core newer than
+/// this package reports a code we have no name for; that is not an error, it is
+/// a kind we cannot act on.
+VaneErrorKind _errorKind(int code) => code < VaneErrorKind.values.length
+    ? VaneErrorKind.values[code]
+    : VaneErrorKind.unknown;
 
 String _readString(_VaneFfiBuffer buffer) {
   final bytes = _readBytes(buffer);

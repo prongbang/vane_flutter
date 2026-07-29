@@ -230,10 +230,55 @@ class VaneResponse {
   }
 }
 
+/// Machine-readable classification of a [VaneHttpException], so callers never
+/// have to match on the core's English error text.
+///
+/// The ordinals are the ABI: they mirror `VaneError::ffi_kind` in the Rust core
+/// and arrive in `VaneFfiResponse.error_kind`. Append only, never reorder. A
+/// code this build does not know decodes as [unknown], which is also what
+/// errors raised on the Dart side of the boundary carry.
+enum VaneErrorKind {
+  unknown,
+
+  /// The request or client configuration is wrong — URL, scheme, method,
+  /// header, body file, pin or proxy setting. Retrying changes nothing.
+  invalidRequest,
+
+  /// The request's cancel token was set.
+  cancelled,
+
+  /// The connection was not established within the deadline.
+  connectTimeout,
+
+  /// The deadline expired with the connection already up.
+  timeout,
+
+  /// Network or protocol failure: DNS, socket, QUIC, HTTP/3 framing, proxy.
+  transport,
+
+  /// Certificate verification failed, including a pin mismatch.
+  tls,
+
+  /// A request or response body exceeded the configured limit.
+  bodyLimitExceeded,
+
+  /// The requested protocol is not available in this build of the core.
+  protocolUnsupported,
+}
+
 class VaneHttpException implements Exception {
-  const VaneHttpException(this.message, {this.statusCode, this.response});
+  const VaneHttpException(
+    this.message, {
+    this.kind = VaneErrorKind.unknown,
+    this.statusCode,
+    this.response,
+  });
 
   final String message;
+
+  /// What went wrong, independent of [message]. [VaneErrorKind.unknown] means
+  /// the core did not classify it, not that it was not a network failure.
+  final VaneErrorKind kind;
   final int? statusCode;
   final VaneResponse? response;
 

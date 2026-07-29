@@ -52,6 +52,16 @@ Matcher _failsWithHost(String host) {
   );
 }
 
+/// The error kind rides in what used to be padding inside `VaneFfiResponse`, so
+/// a wrong offset on either side of the boundary reads garbage rather than
+/// failing to compile. Asserting a known kind against the real library is the
+/// only thing that catches that.
+Matcher _failsWithKind(VaneErrorKind kind) {
+  return throwsA(
+    isA<VaneHttpException>().having((e) => e.kind, 'kind', kind),
+  );
+}
+
 void main() {
   final libraryPath = _libraryPath();
 
@@ -118,6 +128,25 @@ void main() {
         for (var index = 0; index < hosts.length; index += 1) {
           expect(messages[index], contains('vane-${hosts[index]}.invalid'));
         }
+      });
+
+      test('the error kind crosses the FFI boundary', () async {
+        // A URL the core rejects outright, and a host that can never resolve:
+        // two different kinds, so a constant would not pass.
+        await expectLater(
+          platform.execute(client, <String, Object?>{
+            'url': 'http://[',
+            'method': 'GET',
+          }),
+          _failsWithKind(VaneErrorKind.invalidRequest),
+        );
+        await expectLater(
+          platform.execute(client, <String, Object?>{
+            'url': 'https://vane-kind.invalid/probe',
+            'method': 'GET',
+          }),
+          _failsWithKind(VaneErrorKind.transport),
+        );
       });
 
       test('reuses the pool for a second client and its config', () async {
