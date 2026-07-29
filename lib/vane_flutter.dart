@@ -6,6 +6,8 @@ import 'dart:typed_data';
 
 import 'vane_flutter_platform_interface.dart';
 
+export 'vane_flutter_http.dart' show VaneHttpClient;
+
 enum VaneProtocolMode {
   http3ThenHttp2ThenHttp1,
   http3Only,
@@ -503,8 +505,17 @@ class VaneClient {
   final List<VaneErrorInterceptor> _errorInterceptors;
   final VaneFlutterPlatform _platform;
   int? _handle;
+  bool _closed = false;
 
   Future<int> _ensureHandle() async {
+    if (_closed) {
+      // Terminal on purpose: without this, anything that races [close] — a
+      // dispose() while a request is in flight, say — silently creates a
+      // second native client that nobody is left holding to close.
+      throw StateError(
+        'This VaneClient is closed. Create a new one instead of reusing it.',
+      );
+    }
     return _handle ??= await _platform.createClient(_configuration.toMap());
   }
 
@@ -721,7 +732,10 @@ class VaneClient {
     }
   }
 
+  /// Closes the native client. The instance is spent afterwards: further
+  /// requests throw a [StateError] rather than quietly opening a new one.
   Future<void> close() async {
+    _closed = true;
     final handle = _handle;
     _handle = null;
     if (handle != null) {

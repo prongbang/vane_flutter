@@ -6,6 +6,8 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
+import 'package:http_profile/http_profile.dart';
+import 'package:meta/meta.dart';
 
 import 'vane_flutter.dart';
 import 'vane_flutter_platform_interface.dart';
@@ -252,23 +254,67 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
     _workerPool = null;
   }
 
+  /// Base URLs by client handle, kept only so a profiled request can be
+  /// reported under its absolute URL — Rust still owns the actual join.
+  final Map<int, String> _baseUrls = <int, String>{};
+
   @override
   Future<int> createClient(Map<String, Object?> configuration) async {
-    return _nativeBindings.createClient(configuration);
+    final handle = _nativeBindings.createClient(configuration);
+    final baseUrl = configuration['baseUrl'] as String?;
+    if (baseUrl != null && baseUrl.isNotEmpty) {
+      _baseUrls[handle] = baseUrl;
+    }
+    return handle;
   }
 
   @override
   Future<VaneResponse> execute(int handle, Map<String, Object?> request) async {
-    // The worker only runs the blocking native call and hands back the response
-    // pointer; decoding happens here so the body can stay a view over the
-    // native buffer.
-    return _nativeBindings.readResponse(
-      await _workers.execute(handle, request),
-    );
+    // With DevTools profiling off — the default — this whole feature costs one
+    // static bool read and the null checks below. Nothing is allocated and the
+    // response body is never touched.
+    HttpClientRequestProfile? profile;
+    if (HttpClientRequestProfile.profilingEnabled) {
+      // Profiling is never load-bearing: recording a request must not be able
+      // to change, delay or fail it.
+      try {
+        profile = await _startProfile(request, _baseUrls[handle]);
+      } catch (_) {
+        profile = null;
+      }
+    }
+    try {
+      // The worker only runs the blocking native call and hands back the
+      // response pointer; decoding happens here so the body can stay a view
+      // over the native buffer.
+      final address = await _workers.execute(handle, request);
+      // The core is one blocking call, so this is the earliest observable
+      // moment of the response — not a true first-byte timestamp.
+      final responseTime = profile == null ? null : DateTime.now();
+      final response = _nativeBindings.readResponse(address);
+      if (profile != null) {
+        try {
+          await _finishProfile(profile, response, responseTime);
+        } catch (_) {
+          // A recording failure must not turn a good response into an error.
+        }
+      }
+      return response;
+    } catch (error) {
+      if (profile != null) {
+        try {
+          await profile.responseData.closeWithError(error.toString());
+        } catch (_) {
+          // Never let a recording failure mask the real error.
+        }
+      }
+      rethrow;
+    }
   }
 
   @override
   Future<void> closeClient(int handle) async {
+    _baseUrls.remove(handle);
     _nativeBindings.closeClient(handle);
   }
 
@@ -722,6 +768,100 @@ class _VaneFfiBindings {
   }
 
   void freeProgress(int id) => _progressFree(id);
+}
+
+/// Bodies above this are recorded as a content length only. The VM keeps
+/// profile data for the life of the process, so a handful of large transfers
+/// would otherwise pin tens of megabytes in a debug build.
+const int _maxProfiledBodyBytes = 1 << 20;
+
+/// Opens a DevTools Network profile for [request]. Only reached when profiling
+/// is enabled, so none of this allocates on a normal request. Returns null in
+/// product mode, where `package:http_profile` is tree-shaken away.
+Future<HttpClientRequestProfile?> _startProfile(
+  Map<String, Object?> request,
+  String? baseUrl,
+) async {
+  HttpClientRequestProfile? profile;
+  try {
+    profile = HttpClientRequestProfile.profile(
+      requestStartTime: DateTime.now(),
+      requestMethod: request['method'] as String? ?? 'GET',
+      requestUri: _profileUri(request, baseUrl),
+    );
+    if (profile == null) {
+      return null;
+    }
+    final headers = _stringMap(request['headers']);
+    if (headers.isNotEmpty) {
+      profile.requestData.headersCommaValues = headers;
+    }
+    profile.requestData.followRedirects = request['followRedirects'] as bool?;
+    final body = request['body'] as Uint8List?;
+    if (body != null) {
+      profile.requestData.contentLength = body.length;
+      if (body.length <= _maxProfiledBodyBytes) {
+        profile.requestData.bodySink.add(body);
+      }
+    }
+    await profile.requestData.close();
+    return profile;
+  } catch (error) {
+    // The profile is registered with the VM store as soon as it is created, so
+    // close it out rather than orphaning it, and run the request unprofiled.
+    await profile?.requestData.closeWithError(error.toString());
+    return null;
+  }
+}
+
+Future<void> _finishProfile(
+  HttpClientRequestProfile profile,
+  VaneResponse response,
+  DateTime? responseTime,
+) async {
+  try {
+    profile.responseData
+      ..startTime = responseTime
+      ..statusCode = response.statusCode
+      ..contentLength = response.body.length
+      ..headersCommaValues = response.headers;
+    if (response.body.length <= _maxProfiledBodyBytes) {
+      // The sink copies the bytes, which is the price of profiling; the
+      // response itself keeps its zero-copy view.
+      profile.responseData.bodySink.add(response.body);
+    }
+    await profile.responseData.close();
+  } catch (error) {
+    await profile.responseData.closeWithError(error.toString());
+  }
+}
+
+/// Exposes the DevTools URL join for testing; [_startProfile] is its only
+/// runtime caller.
+@visibleForTesting
+String profileRequestUri(Map<String, Object?> request, String? baseUrl) =>
+    _profileUri(request, baseUrl);
+
+/// Mirrors Rust's `base_url.join(url)` + query append so the Network tab shows
+/// the URL that was actually requested. Falls back to the raw value rather than
+/// letting a malformed URL break the request it is only trying to describe.
+String _profileUri(Map<String, Object?> request, String? baseUrl) {
+  final url = request['url'] as String? ?? '';
+  try {
+    var uri = Uri.parse(url);
+    if (baseUrl != null && !uri.hasScheme) {
+      uri = Uri.parse(baseUrl).resolveUri(uri);
+    }
+    final query = _stringMap(request['queryParams']);
+    if (query.isNotEmpty) {
+      uri = uri.replace(
+        queryParameters: <String, String>{...uri.queryParameters, ...query},
+      );
+    }
+    return uri.toString();
+  } on FormatException {
+    return url;
+  }
 }
 
 Map<String, String> _readHeaders(_VaneFfiHeaderArray headers) {

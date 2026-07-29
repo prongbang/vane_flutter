@@ -4,6 +4,8 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http_profile/http_profile.dart';
 import 'package:vane_flutter/vane_flutter.dart';
 import 'package:vane_flutter/vane_flutter_ffi.dart';
 
@@ -255,6 +257,124 @@ void main() {
         );
       });
 
+      test('the http adapter maps a real transport failure', () async {
+        final vane = VaneClient(
+          configuration: const VaneConfiguration(timeoutSeconds: 5),
+          platform: platform,
+        );
+        final adapter = VaneHttpClient(client: vane);
+
+        await expectFastFailure(
+          adapter.get(Uri.parse('https://vane-adapter.invalid/probe')),
+          throwsA(
+            isA<http.ClientException>().having(
+              (e) => e.message,
+              'message',
+              contains('vane-adapter.invalid'),
+            ),
+          ),
+        );
+
+        adapter.close();
+        await vane.close();
+      });
+
+      test('profiling is off by default, and off means no profile at all', () {
+        // This is the exact gate the FFI layer checks before it allocates
+        // anything, so "disabled costs a bool read" rests on it.
+        expect(HttpClientRequestProfile.profilingEnabled, isFalse);
+        expect(
+          HttpClientRequestProfile.profile(
+            requestStartTime: DateTime.now(),
+            requestMethod: 'GET',
+            requestUri: 'https://example.com/',
+          ),
+          isNull,
+        );
+      });
+
+      test('recording a failed request changes nothing about it', () async {
+        HttpClientRequestProfile.profilingEnabled = true;
+        addTearDown(() => HttpClientRequestProfile.profilingEnabled = false);
+        expect(
+          HttpClientRequestProfile.profile(
+            requestStartTime: DateTime.now(),
+            requestMethod: 'GET',
+            requestUri: 'https://example.com/',
+          ),
+          isNotNull,
+          reason: 'profiling must actually be on for this to mean anything',
+        );
+
+        // Same error, same speed: the error branch records through
+        // closeWithError and rethrows untouched.
+        await expectFastFailure(
+          platform.execute(client, <String, Object?>{
+            'url': 'https://vane-profiled.invalid/probe',
+            'method': 'GET',
+            'headers': <String, String>{'x-probe': '1'},
+            'body': Uint8List.fromList(<int>[1, 2, 3]),
+          }),
+          _failsWithHost('vane-profiled.invalid'),
+        );
+
+        // A URL Dart's Uri cannot parse must still fail as a Vane error:
+        // profiling describes a request, it never gets to break one.
+        await expectFastFailure(
+          platform.execute(client, <String, Object?>{
+            'url': 'http://[',
+            'method': 'GET',
+          }),
+          throwsA(
+            isA<VaneHttpException>().having(
+              (e) => e.message,
+              'message',
+              contains('Invalid URL'),
+            ),
+          ),
+        );
+
+        // Same for a request map the recorder itself chokes on: the caller must
+        // still get the ordinary Vane error, not the recorder's TypeError.
+        await expectFastFailure(
+          platform.execute(client, <String, Object?>{
+            'url': 'https://vane-profiled-bad-body.invalid/probe',
+            'method': 'GET',
+            'body': 'not-bytes',
+          }),
+          throwsA(
+            isA<VaneHttpException>().having(
+              (e) => e.message,
+              'message',
+              contains('Uint8List'),
+            ),
+          ),
+        );
+      });
+
+      test('the profile url mirrors the join the core performs', () {
+        expect(
+          profileRequestUri(<String, Object?>{
+            'url': 'https://example.com/a',
+          }, 'https://base.example/api/'),
+          'https://example.com/a',
+          reason: 'an absolute url wins over the base url',
+        );
+        expect(
+          profileRequestUri(<String, Object?>{
+            'url': 'users',
+          }, 'https://base.example/api/'),
+          'https://base.example/api/users',
+        );
+        expect(
+          profileRequestUri(<String, Object?>{
+            'url': 'https://example.com/a?keep=1',
+            'queryParams': <String, String>{'page': '2'},
+          }, null),
+          'https://example.com/a?keep=1&page=2',
+        );
+      });
+
       // The zero-copy body only exists on a successful response, which needs a
       // real HTTP/3 server — same gate the Rust live tests use.
       test(
@@ -294,6 +414,60 @@ void main() {
 
           expect(response.body.length, snapshot.length);
           expect(Object.hashAll(response.body), Object.hashAll(snapshot));
+          expect(response.text, isNotEmpty);
+
+          await platform.closeClient(live);
+        },
+      );
+
+      test(
+        'the http adapter round-trips a real response',
+        skip: _liveBaseUrl() == null
+            ? 'set VANE_TEST_BASE_URL to an https:// HTTP/3 host'
+            : null,
+        () async {
+          final vane = VaneClient(
+            configuration: const VaneConfiguration(timeoutSeconds: 20),
+            platform: platform,
+          );
+          final adapter = VaneHttpClient(client: vane);
+
+          final response = await adapter.get(Uri.parse(_liveBaseUrl()!));
+
+          expect(response.statusCode, 200);
+          expect(response.bodyBytes, isNotEmpty);
+          expect(response.body, isNotEmpty);
+          expect(response.headers, isNotEmpty);
+          expect(response.request?.method, 'GET');
+
+          adapter.close();
+          await vane.close();
+        },
+      );
+
+      test(
+        'a profiled live request keeps its body and resolves its base url',
+        skip: _liveBaseUrl() == null
+            ? 'set VANE_TEST_BASE_URL to an https:// HTTP/3 host'
+            : null,
+        () async {
+          HttpClientRequestProfile.profilingEnabled = true;
+          addTearDown(() => HttpClientRequestProfile.profilingEnabled = false);
+
+          // Relative url + baseUrl also drives the profile's URL join, and the
+          // response body is handed to the profile sink while staying a
+          // zero-copy view here.
+          final live = await platform.createClient(<String, Object?>{
+            'baseUrl': _liveBaseUrl(),
+            'timeoutSeconds': 20,
+          });
+          final response = await platform.execute(live, <String, Object?>{
+            'url': '/',
+            'method': 'GET',
+          });
+
+          expect(response.statusCode, 200);
+          expect(response.body, isNotEmpty);
           expect(response.text, isNotEmpty);
 
           await platform.closeClient(live);
