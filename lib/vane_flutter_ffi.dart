@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
@@ -231,10 +232,25 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
   FfiVaneFlutter({this._library});
 
   final DynamicLibrary? _library;
-  _VaneFfiBindings? _bindings;
 
-  _VaneFfiBindings get _nativeBindings =>
-      _bindings ??= _VaneFfiBindings(_library ?? _openLibrary());
+  late final DynamicLibrary _resolvedLibrary = _library ?? _openLibrary();
+  late final _VaneFfiBindings _nativeBindings = _VaneFfiBindings(
+    _resolvedLibrary,
+  );
+  _VaneWorkerPool? _workerPool;
+
+  _VaneWorkerPool get _workers =>
+      _workerPool ??= _VaneWorkerPool(_resolvedLibrary);
+
+  /// Releases the worker isolates and their ports. Deliberately not on
+  /// [VaneFlutterPlatform]: workers are shared by every client, so this is for
+  /// test teardown (or a host that owns this instance directly), not for
+  /// closing a single client — use [closeClient] for that. Idempotent; a later
+  /// request just spawns a fresh worker.
+  void dispose() {
+    _workerPool?.dispose();
+    _workerPool = null;
+  }
 
   @override
   Future<int> createClient(Map<String, Object?> configuration) async {
@@ -242,8 +258,13 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
   }
 
   @override
-  Future<VaneResponse> execute(int handle, Map<String, Object?> request) {
-    return Isolate.run(() => _VaneFfiBindings.shared.execute(handle, request));
+  Future<VaneResponse> execute(int handle, Map<String, Object?> request) async {
+    // The worker only runs the blocking native call and hands back the response
+    // pointer; decoding happens here so the body can stay a view over the
+    // native buffer.
+    return _nativeBindings.readResponse(
+      await _workers.execute(handle, request),
+    );
   }
 
   @override
@@ -301,6 +322,207 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
   }
 }
 
+/// Worker isolates for the blocking native call, spawned on demand and reused.
+class _VaneWorkerPool {
+  _VaneWorkerPool(this._library);
+
+  // ponytail: 4 workers. Each one is an isolate blocked in Rust for the whole
+  // request, so the cap is about how many requests may overlap, not cores;
+  // beyond it requests queue on the least busy worker. Raise it if profiles
+  // show real queueing.
+  static const int _maxWorkers = 4;
+
+  final DynamicLibrary _library;
+  final List<_VaneWorker> _workers = <_VaneWorker>[];
+
+  Future<int> execute(int handle, Map<String, Object?> request) {
+    return _pick().execute(handle, request);
+  }
+
+  _VaneWorker _pick() {
+    _workers.removeWhere((worker) => worker.isDead);
+    if (_workers.isEmpty) {
+      return _spawn();
+    }
+    final idlest = _workers.reduce((a, b) => b.inFlight < a.inFlight ? b : a);
+    if (idlest.inFlight > 0 && _workers.length < _maxWorkers) {
+      return _spawn();
+    }
+    return idlest;
+  }
+
+  _VaneWorker _spawn() {
+    final worker = _VaneWorker(_library);
+    _workers.add(worker);
+    return worker;
+  }
+
+  void dispose() {
+    for (final worker in _workers) {
+      worker.dispose();
+    }
+    _workers.clear();
+  }
+}
+
+/// Long-lived isolate that runs the blocking `vane_ffi_execute` call off the
+/// calling isolate. The symbol is resolved once at spawn and handed over as a
+/// pointer (a `DynamicLibrary` cannot cross isolates, so this is also what
+/// keeps an injected test library in effect); requests are id-tagged so
+/// concurrent callers multiplex over one worker.
+class _VaneWorker {
+  _VaneWorker(DynamicLibrary library) {
+    _responses.listen(_onResponse);
+    _ready =
+        Isolate.spawn(
+          _main,
+          (
+            _responses.sendPort,
+            library.lookup<NativeFunction<_ExecuteNative>>('vane_ffi_execute'),
+          ),
+          // Without these an isolate that dies takes every request routed to it
+          // with it, silently, and those futures never complete.
+          onExit: _responses.sendPort,
+          onError: _responses.sendPort,
+        ).then((isolate) {
+          _isolate = isolate;
+          return _commands.future;
+        });
+    // A failed spawn has to retire the worker too; callers still see the error
+    // through their own `await _ready`.
+    _ready.then<void>((_) {}, onError: _die);
+  }
+
+  final ReceivePort _responses = ReceivePort();
+  final Completer<SendPort> _commands = Completer<SendPort>();
+  final Map<int, Completer<int>> _pending = <int, Completer<int>>{};
+  late final Future<SendPort> _ready;
+  Isolate? _isolate;
+  int _nextId = 0;
+  int _inFlight = 0;
+  bool _dead = false;
+
+  int get inFlight => _inFlight;
+
+  bool get isDead => _dead;
+
+  /// Completes with the address of the native response, which the caller then
+  /// owns and must free (directly or through a finalizer).
+  Future<int> execute(int handle, Map<String, Object?> request) async {
+    _inFlight += 1;
+    try {
+      final commands = await _ready;
+      final id = _nextId += 1;
+      // Send first: an unsendable value in the request map throws here, and a
+      // completer registered before that would never be completed or removed.
+      commands.send((id, handle, request));
+      final completer = Completer<int>();
+      _pending[id] = completer;
+      return await completer.future;
+    } finally {
+      _inFlight -= 1;
+    }
+  }
+
+  void dispose() {
+    _die(const VaneHttpException('Vane worker isolate was disposed.'));
+  }
+
+  void _onResponse(Object? message) {
+    if (message is SendPort) {
+      _commands.complete(message);
+      return;
+    }
+    if (message == null || message is List) {
+      // onExit sends null, onError sends [error, stackTrace]. Either way the
+      // isolate is gone.
+      _die(
+        VaneHttpException(
+          message is List
+              ? 'Vane worker isolate died: ${message.first}'
+              : 'Vane worker isolate exited unexpectedly.',
+        ),
+        message is List && message.length > 1
+            ? StackTrace.fromString('${message[1]}')
+            : null,
+      );
+      return;
+    }
+    final (id, address, error, stackTrace) =
+        message as (int, int, String?, String?);
+    final completer = _pending.remove(id);
+    if (completer == null) {
+      return;
+    }
+    if (error != null) {
+      completer.completeError(
+        VaneHttpException(error),
+        StackTrace.fromString(stackTrace ?? ''),
+      );
+    } else {
+      completer.complete(address);
+    }
+  }
+
+  /// The worker is gone — exited, crashed, failed to spawn, or disposed. Fail
+  /// everything routed to it so callers get an error instead of a future that
+  /// never completes, and let the pool retire it. `_inFlight` is left to the
+  /// `finally` in [execute], which drains it exactly once per call.
+  ///
+  /// A native response still in flight is leaked: its reply lands on a closed
+  /// port with no one left to free it. Bounded by the requests outstanding at
+  /// teardown, so it is not worth a drain protocol.
+  void _die(Object error, [StackTrace? stackTrace]) {
+    if (_dead) {
+      return;
+    }
+    _dead = true;
+    if (!_commands.isCompleted) {
+      _commands.completeError(error, stackTrace);
+    }
+    for (final completer in _pending.values) {
+      completer.completeError(error, stackTrace);
+    }
+    _pending.clear();
+    _responses.close();
+    _isolate?.kill(priority: Isolate.immediate);
+  }
+
+  static void _main((SendPort, Pointer<NativeFunction<_ExecuteNative>>) init) {
+    final (responses, executePointer) = init;
+    // Bound once per worker instead of once per request.
+    final execute = executePointer.asFunction<_ExecuteDart>();
+    final commands = ReceivePort();
+    responses.send(commands.sendPort);
+    commands.listen((Object? message) {
+      // Everything, including the destructuring, is inside the try: an error
+      // escaping this callback kills the isolate and leaves the caller's future
+      // pending forever.
+      var id = 0;
+      _NativeRequest? nativeRequest;
+      try {
+        final (requestId, handle, request) =
+            message as (int, int, Map<String, Object?>);
+        id = requestId;
+        nativeRequest = _NativeRequest(request);
+        final response = execute(
+          handle,
+          nativeRequest.pointer,
+          nativeRequest.body.pointer,
+          nativeRequest.body.length,
+        );
+        responses.send((id, response.address, null, null));
+      } catch (error, stackTrace) {
+        // Strings only: sending an arbitrary caught object can itself throw
+        // (unsendable), which would kill the worker while reporting a failure.
+        responses.send((id, 0, error.toString(), stackTrace.toString()));
+      } finally {
+        nativeRequest?.free();
+      }
+    });
+  }
+}
+
 class _VaneFfiBindings {
   _VaneFfiBindings(DynamicLibrary library)
     : _clientCreate = library
@@ -315,45 +537,56 @@ class _VaneFfiBindings {
           .lookupFunction<_SetCertificatePinsNative, _SetCertificatePinsDart>(
             'vane_ffi_client_set_certificate_pins',
           ),
-      _execute = library.lookupFunction<_ExecuteNative, _ExecuteDart>(
-        'vane_ffi_execute',
-      ),
+      // isLeaf: these are id-table lookups and deallocations — no callbacks
+      // into Dart, no blocking work. vane_ffi_execute and the client calls
+      // stay non-leaf because they can run for the whole request.
       _responseFree = library
           .lookupFunction<_ResponseFreeNative, _ResponseFreeDart>(
             'vane_ffi_response_free',
+            isLeaf: true,
           ),
+      // Same symbol again, as a finalizer: its `VaneFfiResponse*` argument is
+      // ABI-compatible with NativeFinalizerFunction's `Pointer<Void>`.
+      _responseFinalizer = library.lookup<NativeFinalizerFunction>(
+        'vane_ffi_response_free',
+      ),
       _bufferFree = library.lookupFunction<_BufferFreeNative, _BufferFreeDart>(
         'vane_ffi_buffer_free',
+        isLeaf: true,
       ),
       _cancelTokenCreate = library
           .lookupFunction<_IdCreateNative, _IdCreateDart>(
             'vane_ffi_cancel_token_create',
+            isLeaf: true,
           ),
       _cancelTokenCancel = library
           .lookupFunction<_IdActionNative, _IdActionDart>(
             'vane_ffi_cancel_token_cancel',
+            isLeaf: true,
           ),
       _cancelTokenFree = library.lookupFunction<_IdActionNative, _IdActionDart>(
         'vane_ffi_cancel_token_free',
+        isLeaf: true,
       ),
       _progressCreate = library.lookupFunction<_IdCreateNative, _IdCreateDart>(
         'vane_ffi_progress_create',
+        isLeaf: true,
       ),
       _progressSnapshot = library
           .lookupFunction<_ProgressSnapshotNative, _ProgressSnapshotDart>(
             'vane_ffi_progress_snapshot',
+            isLeaf: true,
           ),
       _progressFree = library.lookupFunction<_IdActionNative, _IdActionDart>(
         'vane_ffi_progress_free',
+        isLeaf: true,
       );
-
-  static final shared = _VaneFfiBindings(FfiVaneFlutter._openLibrary());
 
   final _ClientCreateDart _clientCreate;
   final _ClientCloseDart _clientClose;
   final _SetCertificatePinsDart _setCertificatePins;
-  final _ExecuteDart _execute;
   final _ResponseFreeDart _responseFree;
+  final Pointer<NativeFinalizerFunction> _responseFinalizer;
   final _BufferFreeDart _bufferFree;
   final _IdCreateDart _cancelTokenCreate;
   final _IdActionDart _cancelTokenCancel;
@@ -382,37 +615,51 @@ class _VaneFfiBindings {
     }
   }
 
-  VaneResponse execute(int handle, Map<String, Object?> request) {
-    final nativeRequest = _NativeRequest(request);
-    Pointer<_VaneFfiResponse> responsePtr = nullptr;
+  /// Decodes the response a worker handed back, taking ownership of it. Every
+  /// exit frees the response exactly once: eagerly here, or — once the body
+  /// view exists — through the finalizer when that view becomes unreachable.
+  VaneResponse readResponse(int address) {
+    final pointer = Pointer<_VaneFfiResponse>.fromAddress(address);
+    if (pointer == nullptr) {
+      throw const VaneHttpException('Native Vane request returned null.');
+    }
+    var owned = true;
     try {
-      responsePtr = _execute(
-        handle,
-        nativeRequest.pointer,
-        nativeRequest.body.pointer,
-        nativeRequest.body.length,
-      );
-      if (responsePtr == nullptr) {
-        throw const VaneHttpException('Native Vane request returned null.');
-      }
-      final response = responsePtr.ref;
+      final response = pointer.ref;
       final error = _readString(response.error);
       if (error.isNotEmpty) {
         throw VaneHttpException(error);
       }
+      final headers = _readHeaders(response.headers);
+      final bodyFilePath = _readString(response.bodyFilePath);
+      final url = _readString(response.url);
+      final buffer = response.body;
+      final Uint8List body;
+      if (buffer.data == nullptr || buffer.len == 0) {
+        body = Uint8List(0);
+      } else {
+        // Zero-copy view over the native body. The token is the response
+        // pointer, not the default (the data pointer), because the finalizer
+        // frees the whole response.
+        body = buffer.data.asTypedList(
+          buffer.len,
+          finalizer: _responseFinalizer,
+          token: pointer.cast(),
+        );
+        owned = false;
+      }
       return VaneResponse(
         statusCode: response.statusCode,
-        headers: _readHeaders(response.headers),
-        body: _readBytes(response.body),
-        bodyFilePath: _readString(response.bodyFilePath),
+        headers: headers,
+        body: body,
+        bodyFilePath: bodyFilePath,
         isSuccess: response.isSuccess,
-        url: _readString(response.url),
+        url: url,
       );
     } finally {
-      if (responsePtr != nullptr) {
-        _responseFree(responsePtr);
+      if (owned) {
+        _responseFree(pointer);
       }
-      nativeRequest.free();
     }
   }
 
@@ -424,13 +671,15 @@ class _VaneFfiBindings {
     final nativeHost = _NativeString(host);
     final nativePins = _NativeStringArray(pins);
     final error = calloc<_VaneFfiBuffer>();
+    final nativeHostValue = calloc<_VaneFfiString>();
     final nativeList = calloc<_VaneFfiStringList>();
     try {
+      nativeHost.writeTo(nativeHostValue.ref);
       nativeList.ref.values = nativePins.pointer;
       nativeList.ref.len = nativePins.length;
       final ok = _setCertificatePins(
         handle,
-        nativeHost.value,
+        nativeHostValue.ref,
         nativeList.ref,
         error,
       );
@@ -446,6 +695,7 @@ class _VaneFfiBindings {
       }
     } finally {
       calloc.free(nativeList);
+      calloc.free(nativeHostValue);
       calloc.free(error);
       nativePins.free();
       nativeHost.free();
@@ -472,33 +722,33 @@ class _VaneFfiBindings {
   }
 
   void freeProgress(int id) => _progressFree(id);
+}
 
-  Map<String, String> _readHeaders(_VaneFfiHeaderArray headers) {
-    if (headers.data == nullptr || headers.len == 0) {
-      return const <String, String>{};
-    }
-    final map = <String, String>{};
-    for (var index = 0; index < headers.len; index += 1) {
-      final header = (headers.data + index).ref;
-      map[_readString(header.key)] = _readString(header.value);
-    }
-    return map;
+Map<String, String> _readHeaders(_VaneFfiHeaderArray headers) {
+  if (headers.data == nullptr || headers.len == 0) {
+    return const <String, String>{};
   }
+  final map = <String, String>{};
+  for (var index = 0; index < headers.len; index += 1) {
+    final header = (headers.data + index).ref;
+    map[_readString(header.key)] = _readString(header.value);
+  }
+  return map;
+}
 
-  String _readString(_VaneFfiBuffer buffer) {
-    final bytes = _readBytes(buffer);
-    if (bytes.isEmpty) {
-      return '';
-    }
-    return utf8.decode(bytes);
+String _readString(_VaneFfiBuffer buffer) {
+  final bytes = _readBytes(buffer);
+  if (bytes.isEmpty) {
+    return '';
   }
+  return utf8.decode(bytes);
+}
 
-  Uint8List _readBytes(_VaneFfiBuffer buffer) {
-    if (buffer.data == nullptr || buffer.len == 0) {
-      return Uint8List(0);
-    }
-    return Uint8List.fromList(buffer.data.asTypedList(buffer.len));
+Uint8List _readBytes(_VaneFfiBuffer buffer) {
+  if (buffer.data == nullptr || buffer.len == 0) {
+    return Uint8List(0);
   }
+  return Uint8List.fromList(buffer.data.asTypedList(buffer.len));
 }
 
 class _NativeConfig {
@@ -521,7 +771,7 @@ class _NativeConfig {
         config['proxyAuthorization'] as String?,
       ) {
     final ref = pointer.ref;
-    ref.baseUrl = baseUrl.value;
+    baseUrl.writeTo(ref.baseUrl);
     ref.defaultHeaders = defaultHeaders.pointer;
     ref.defaultHeadersLen = defaultHeaders.length;
     ref.dnsOverrides = dnsOverrides.pointer;
@@ -529,7 +779,7 @@ class _NativeConfig {
     ref.certificatePins = certificatePins.pointer;
     ref.certificatePinsLen = certificatePins.length;
     ref.cookiesEnabled = config['cookiesEnabled'] as bool? ?? false;
-    ref.cookiePersistencePath = cookiePersistencePath.value;
+    cookiePersistencePath.writeTo(ref.cookiePersistencePath);
     ref.connectionPoolEnabled =
         config['connectionPoolEnabled'] as bool? ?? true;
     ref.maxIdleConnections = config['maxIdleConnections'] as int? ?? 8;
@@ -545,10 +795,10 @@ class _NativeConfig {
         config['maxResponseBodyBytes'] as int? ?? 10485760;
     ref.timeoutSeconds = config['timeoutSeconds'] as int? ?? -1;
     ref.followRedirects = config['followRedirects'] as bool? ?? true;
-    ref.userAgent = userAgent.value;
+    userAgent.writeTo(ref.userAgent);
     ref.protocolMode = _protocolMode(config['protocolMode'] as String?);
-    ref.proxyUrl = proxyUrl.value;
-    ref.proxyAuthorization = proxyAuthorization.value;
+    proxyUrl.writeTo(ref.proxyUrl);
+    proxyAuthorization.writeTo(ref.proxyAuthorization);
   }
 
   final Pointer<_VaneFfiClientConfig> pointer;
@@ -585,14 +835,14 @@ class _NativeRequest {
       responseBodyPath = _NativeString(request['responseBodyPath'] as String?),
       body = _NativeBytes((request['body'] as Uint8List?) ?? Uint8List(0)) {
     final ref = pointer.ref;
-    ref.url = url.value;
-    ref.method = method.value;
+    url.writeTo(ref.url);
+    method.writeTo(ref.method);
     ref.headers = headers.pointer;
     ref.headersLen = headers.length;
     ref.queryParams = queryParams.pointer;
     ref.queryParamsLen = queryParams.length;
-    ref.bodyFilePath = bodyFilePath.value;
-    ref.responseBodyPath = responseBodyPath.value;
+    bodyFilePath.writeTo(ref.bodyFilePath);
+    responseBodyPath.writeTo(ref.responseBodyPath);
     ref.cancelTokenId = request['cancelTokenId'] as int? ?? 0;
     ref.progressId = request['progressId'] as int? ?? 0;
     ref.timeoutSeconds = request['timeoutSeconds'] as int? ?? -1;
@@ -633,8 +883,8 @@ class _NativeStringPairArray {
       strings
         ..add(key)
         ..add(value);
-      pointer[index].key = key.value;
-      pointer[index].value = value.value;
+      key.writeTo(pointer[index].key);
+      value.writeTo(pointer[index].value);
       index += 1;
     }
   }
@@ -665,7 +915,7 @@ class _NativeStringListPairArray {
       final list = _NativeStringArray(entry.value);
       keys.add(key);
       lists.add(list);
-      pointer[index].key = key.value;
+      key.writeTo(pointer[index].key);
       pointer[index].values.values = list.pointer;
       pointer[index].values.len = list.length;
       index += 1;
@@ -699,7 +949,7 @@ class _NativeStringArray {
     for (var index = 0; index < values.length; index += 1) {
       final string = _NativeString(values[index]);
       strings.add(string);
-      pointer[index] = string.value;
+      string.writeTo(pointer[index]);
     }
   }
 
@@ -725,15 +975,9 @@ class _NativeString {
 
   final _NativeBytes bytes;
 
-  _VaneFfiString get value {
-    final string = calloc<_VaneFfiString>();
-    try {
-      string.ref.data = bytes.pointer;
-      string.ref.len = bytes.length;
-      return string.ref;
-    } finally {
-      calloc.free(string);
-    }
+  void writeTo(_VaneFfiString target) {
+    target.data = bytes.pointer;
+    target.len = bytes.length;
   }
 
   void free() {
