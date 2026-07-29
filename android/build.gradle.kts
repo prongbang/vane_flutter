@@ -75,6 +75,10 @@ kotlin {
 }
 
 dependencies {
+    // JVM half of rustls-platform-verifier; see VaneKotlin/library/build.gradle.kts.
+    // Taken from the same vendored jar, because this module source-includes
+    // VaneKotlin's Kotlin rather than depending on its AAR.
+    api(files("../../VaneKotlin/library/libs/rustls-platform-verifier-0.1.1.jar"))
     implementation("net.java.dev.jna:jna:5.18.1@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")

@@ -1,3 +1,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
   package="com.inteniquetic.vane_flutter">
+
+  <application>
+    <!--
+    Same provider class as VaneKotlin's own AAR, registered again here because
+    this plugin source-includes that library's Kotlin but not its manifest.
+    Both the Dart FFI path and the MethodChannel path share one process and one
+    loaded libvane.so, so this single init serves both.
+    -->
+    <provider
+      android:name="com.inteniquetic.vanekotlin.VaneInitProvider"
+      android:authorities="${applicationId}.vaneinit"
+      android:exported="false"
+      android:initOrder="100" />
+  </application>
 </manifest>
