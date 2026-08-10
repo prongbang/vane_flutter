@@ -57,13 +57,33 @@ Matcher _failsWithHost(String host) {
 /// failing to compile. Asserting a known kind against the real library is the
 /// only thing that catches that.
 Matcher _failsWithKind(VaneErrorKind kind) {
-  return throwsA(
-    isA<VaneHttpException>().having((e) => e.kind, 'kind', kind),
-  );
+  return throwsA(isA<VaneHttpException>().having((e) => e.kind, 'kind', kind));
 }
 
 void main() {
   final libraryPath = _libraryPath();
+
+  // Declared (and therefore run) before anything dlopens the real libvane:
+  // on macOS a dlopen can make its symbols globally visible, which would let
+  // `DynamicLibrary.process()` find `vane_ffi_abi_version` and invalidate the
+  // missing-symbol case below.
+  group('native ABI guard', () {
+    test('a library without the version symbol is refused as skew', () async {
+      // The test VM itself: a real library with no vane symbols in it — the
+      // shape of a core that predates ABI versioning.
+      final platform = FfiVaneFlutter(library: DynamicLibrary.process());
+      await expectLater(
+        platform.createClient(<String, Object?>{}),
+        throwsA(
+          isA<VaneHttpException>().having(
+            (e) => e.message,
+            'message',
+            allOf(contains('vane_ffi_abi_version'), contains('ABI v1')),
+          ),
+        ),
+      );
+    });
+  });
 
   group(
     'FFI worker isolate',
@@ -89,6 +109,25 @@ void main() {
       Future<void> expectFastFailure(Future<Object?> call, Matcher matcher) {
         return expectLater(call.timeout(const Duration(seconds: 10)), matcher);
       }
+
+      /// The happy path of the guard is the whole group: setUpAll resolved
+      /// the library through [verifyNativeAbi], so every test here already
+      /// proves an injected, matching library passes. This pins the mismatch
+      /// branch against the real symbol, naming both versions.
+      test('an ABI version mismatch is refused, naming both versions', () {
+        final library = DynamicLibrary.open(libraryPath!);
+        expect(verifyNativeAbi(library), same(library));
+        expect(
+          () => verifyNativeAbi(library, expected: 999),
+          throwsA(
+            isA<VaneHttpException>().having(
+              (e) => e.message,
+              'message',
+              allOf(contains('ABI v1'), contains('v999')),
+            ),
+          ),
+        );
+      });
 
       test('propagates Rust errors with the request marshalled intact', () {
         expect(

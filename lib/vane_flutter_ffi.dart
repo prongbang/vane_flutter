@@ -243,12 +243,56 @@ typedef _IdActionDart = void Function(int);
 typedef _ProgressSnapshotNative = _VaneFfiProgress Function(Uint64);
 typedef _ProgressSnapshotDart = _VaneFfiProgress Function(int);
 
+/// The C ABI version this package's structs and calls were written against.
+/// Rust exports the native side as `vane_ffi_abi_version`; the two must match
+/// exactly, because every `_VaneFfi*` struct here mirrors its Rust layout by
+/// hand and a skewed layout reads garbage — or frees wild pointers —
+/// silently. Bump in lockstep with the Rust constant.
+const int _expectedAbiVersion = 1;
+
+/// Verifies the native library speaks this package's C ABI, and returns it.
+///
+/// Runs before any other symbol is bound. A missing symbol means the loaded
+/// core predates ABI versioning (or is not libvane at all) — the same skew
+/// case as a wrong number, and packaging skew has shipped before, so both
+/// fail loudly here instead of corrupting memory later. [expected] exists for
+/// tests; production callers pass nothing.
+@visibleForTesting
+DynamicLibrary verifyNativeAbi(
+  DynamicLibrary library, {
+  int expected = _expectedAbiVersion,
+}) {
+  final int version;
+  try {
+    version = library.lookupFunction<Uint32 Function(), int Function()>(
+      'vane_ffi_abi_version',
+      isLeaf: true,
+    )();
+  } on ArgumentError {
+    throw VaneHttpException(
+      'native libvane does not export vane_ffi_abi_version — the loaded '
+      'library is missing or predates ABI versioning; this package expects '
+      'ABI v$expected. Rebuild/update libvane and this package so they '
+      'match.',
+    );
+  }
+  if (version != expected) {
+    throw VaneHttpException(
+      'native libvane ABI v$version, this package expects v$expected — '
+      'rebuild/update libvane and this package so they match.',
+    );
+  }
+  return library;
+}
+
 class FfiVaneFlutter extends VaneFlutterPlatform {
   FfiVaneFlutter({this._library});
 
   final DynamicLibrary? _library;
 
-  late final DynamicLibrary _resolvedLibrary = _library ?? _openLibrary();
+  late final DynamicLibrary _resolvedLibrary = verifyNativeAbi(
+    _library ?? _openLibrary(),
+  );
   late final _VaneFfiBindings _nativeBindings = _VaneFfiBindings(
     _resolvedLibrary,
   );
