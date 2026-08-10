@@ -50,14 +50,21 @@ class MockVaneFlutterPlatform
     }
   }
 
-  @override
-  Future<int> createCancelToken() async => 11;
+  int createdCancelTokens = 0;
+  final List<int> cancelledTokens = <int>[];
+  final List<int> freedCancelTokens = <int>[];
 
   @override
-  Future<void> cancelToken(int id) async {}
+  Future<int> createCancelToken() async {
+    createdCancelTokens += 1;
+    return 11;
+  }
 
   @override
-  Future<void> freeCancelToken(int id) async {}
+  Future<void> cancelToken(int id) async => cancelledTokens.add(id);
+
+  @override
+  Future<void> freeCancelToken(int id) async => freedCancelTokens.add(id);
 
   @override
   Future<int> createProgress() async => 13;
@@ -295,5 +302,73 @@ void main() {
     expect(fakePlatform.lastRequest?['body'], isNull);
 
     VaneFlutterPlatform.instance = initialPlatform;
+  });
+
+  test('a cancel that lands before the token registers still reaches the '
+      'core', () async {
+    final fakePlatform = MockVaneFlutterPlatform();
+    VaneFlutterPlatform.instance = fakePlatform;
+
+    final token = VaneCancelToken();
+    // The README's shape: cancel in the same microtask as the request, before
+    // `execute` has had a chance to hand the token a native id. This used to
+    // discard the intent outright and let the request run to completion.
+    final pending = Vane.get(
+      '/slow',
+      options: VaneRequestOptions(cancelToken: token),
+    );
+    await token.cancel();
+    await pending;
+
+    expect(token.isCancelled, isTrue);
+    expect(fakePlatform.createdCancelTokens, 1);
+    expect(fakePlatform.cancelledTokens, <int>[11]);
+    expect(fakePlatform.lastRequest?['cancelTokenId'], 11);
+
+    await token.dispose();
+    expect(fakePlatform.freedCancelTokens, <int>[11]);
+
+    // `dispose` clears the latch as well as the native id. A controller that
+    // holds one token as a field and disposes it in a `finally` — the README's
+    // own shape — must be able to retry; leaving the latch armed made the
+    // token cancel every later request forever, with no public way to reset.
+    expect(token.isCancelled, isFalse);
+    fakePlatform.cancelledTokens.clear();
+    await Vane.get('/retry', options: VaneRequestOptions(cancelToken: token));
+    expect(fakePlatform.cancelledTokens, isEmpty);
+    await token.dispose();
+
+    // A stray cancel on a disposed token reaches nothing: the native id is
+    // gone, so there is no freed id to cancel through.
+    await token.cancel();
+    expect(fakePlatform.cancelledTokens, isEmpty);
+
+    await Vane.close();
+    VaneFlutterPlatform.instance = initialPlatform;
+  });
+
+  test('VaneResponse.fromMap reads the new keys and defaults without them', () {
+    final full = VaneResponse.fromMap(<Object?, Object?>{
+      'statusCode': 200,
+      'headers': <Object?, Object?>{},
+      'isSuccess': true,
+      'url': 'https://example.com/',
+      'setCookie': <Object?>['a=1', 'b=2'],
+      'httpVersion': 'http2',
+    });
+    expect(full.setCookie, <String>['a=1', 'b=2']);
+    expect(full.httpVersion, VaneHttpVersion.http2);
+
+    // An older plugin sends neither key, and an unknown spelling is not a
+    // crash.
+    final bare = VaneResponse.fromMap(<Object?, Object?>{
+      'statusCode': 200,
+      'headers': <Object?, Object?>{},
+      'isSuccess': true,
+      'url': 'https://example.com/',
+      'httpVersion': 'http9',
+    });
+    expect(bare.setCookie, isEmpty);
+    expect(bare.httpVersion, isNull);
   });
 }

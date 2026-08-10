@@ -449,6 +449,35 @@ void main() {
         },
       );
 
+      // The only thing that catches a struct-layout desync between Rust's
+      // VaneFfiResponse and the Dart mirror: both new fields are decoded from
+      // the real native response, not from a fake.
+      test(
+        'set-cookie and the negotiated protocol survive the real ABI',
+        skip: _liveBaseUrl() == null
+            ? 'set VANE_TEST_BASE_URL to an https:// HTTP/3 host'
+            : null,
+        () async {
+          final live = await platform.createClient(<String, Object?>{
+            'baseUrl': _liveBaseUrl(),
+            'timeoutSeconds': 20,
+          });
+          final response = await platform.execute(live, <String, Object?>{
+            'url': '/cookies/set/vane_cookie/1',
+            'method': 'GET',
+            'followRedirects': false,
+          });
+
+          expect(response.setCookie, isNotEmpty);
+          expect(response.setCookie.first, contains('vane_cookie'));
+          // Never in the map, or repeats would collapse silently.
+          expect(response.headers, isNot(contains('set-cookie')));
+          expect(response.httpVersion, VaneHttpVersion.http3);
+
+          await platform.closeClient(live);
+        },
+      );
+
       test(
         'the http adapter round-trips a real response',
         skip: _liveBaseUrl() == null

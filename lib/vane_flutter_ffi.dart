@@ -161,6 +161,14 @@ final class _VaneFfiResponse extends Struct {
   @Bool()
   external bool isSuccess;
 
+  /// `VaneHttpVersion::ffi_code`; 0 when the protocol is not known. Declared
+  /// between [isSuccess] and [errorKind] because declaration order IS the
+  /// offset here, and Rust puts it at offset 3 — the one free padding byte.
+  /// Declaring it last would place it past the struct and read garbage,
+  /// silently.
+  @Uint8()
+  external int httpVersion;
+
   /// `VaneError::ffi_kind` for [error]; 0 when there is no error. Declared here
   /// because Rust puts it here, in the padding after `is_success`.
   @Uint32()
@@ -681,7 +689,7 @@ class _VaneFfiBindings {
       if (error.isNotEmpty) {
         throw VaneHttpException(error, kind: _errorKind(response.errorKind));
       }
-      final headers = _readHeaders(response.headers);
+      final (headers, setCookie) = _readHeaders(response.headers);
       final bodyFilePath = _readString(response.bodyFilePath);
       final url = _readString(response.url);
       final buffer = response.body;
@@ -706,6 +714,8 @@ class _VaneFfiBindings {
         bodyFilePath: bodyFilePath,
         isSuccess: response.isSuccess,
         url: url,
+        setCookie: setCookie,
+        httpVersion: _httpVersion(response.httpVersion),
       );
     } finally {
       if (owned) {
@@ -828,8 +838,21 @@ Future<void> _finishProfile(
     profile.responseData
       ..startTime = responseTime
       ..statusCode = response.statusCode
-      ..contentLength = response.body.length
-      ..headersCommaValues = response.headers;
+      ..contentLength = response.body.length;
+    if (response.setCookie.isEmpty) {
+      profile.responseData.headersCommaValues = response.headers;
+    } else {
+      // `response.headers` can never hold `set-cookie` (the core keeps it out
+      // and `_readHeaders` routes it out), so the comma-values map would show
+      // a login response with no Set-Cookie at all — the exact symptom the
+      // field exists to remove. The list-valued map is the only one that can
+      // carry repeats.
+      profile.responseData.headersListValues = <String, List<String>>{
+        for (final header in response.headers.entries)
+          header.key: <String>[header.value],
+        'set-cookie': response.setCookie,
+      };
+    }
     if (response.body.length <= _maxProfiledBodyBytes) {
       // The sink copies the bytes, which is the price of profiling; the
       // response itself keeps its zero-copy view.
@@ -869,17 +892,38 @@ String _profileUri(Map<String, Object?> request, String? baseUrl) {
   }
 }
 
-Map<String, String> _readHeaders(_VaneFfiHeaderArray headers) {
+/// Splits the native header array into the single-valued map and the raw
+/// `Set-Cookie` list.
+///
+/// The array is a list, not a map: the core appends one `("set-cookie", value)`
+/// entry per cookie, so `set-cookie` is the one key that legitimately repeats.
+/// Routing it out is mandatory — left in, N cookies collapse to one arbitrary
+/// value with nothing to notice it by.
+(Map<String, String>, List<String>) _readHeaders(_VaneFfiHeaderArray headers) {
   if (headers.data == nullptr || headers.len == 0) {
-    return const <String, String>{};
+    return (const <String, String>{}, const <String>[]);
   }
   final map = <String, String>{};
+  final setCookie = <String>[];
   for (var index = 0; index < headers.len; index += 1) {
     final header = (headers.data + index).ref;
-    map[_readString(header.key)] = _readString(header.value);
+    final key = _readString(header.key);
+    if (key == 'set-cookie') {
+      setCookie.add(_readString(header.value));
+    } else {
+      map[key] = _readString(header.value);
+    }
   }
-  return map;
+  return (map, setCookie);
 }
+
+/// Ordinals are the ABI contract with `VaneHttpVersion::ffi_code`, which starts
+/// at 1. A core newer than this package reports a code we have no name for;
+/// that is `null`, the same answer as "no exchange completed".
+VaneHttpVersion? _httpVersion(int code) =>
+    code >= 1 && code <= VaneHttpVersion.values.length
+    ? VaneHttpVersion.values[code - 1]
+    : null;
 
 /// Ordinals are the ABI contract with `VaneError::ffi_kind`. A core newer than
 /// this package reports a code we have no name for; that is not an error, it is

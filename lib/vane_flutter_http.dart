@@ -21,12 +21,22 @@ import 'vane_flutter.dart';
 /// Known ceilings, all inherited from the core rather than introduced here:
 /// - The core returns a complete response body, so [send] yields it as a single
 ///   chunk. Real chunked streaming needs an incremental read on the Rust side.
-/// - Response headers are single-valued; `package:http` expects repeated
-///   headers comma-joined, which is what the core already produces.
-/// - `set-cookie` never appears in [http.BaseResponse.headers]: the core routes
-///   it into its own cookie jar and does not re-surface it. Session and auth
-///   packages that read `set-cookie` themselves will see nothing — enable
-///   Vane's cookie jar instead ([VaneConfiguration.cookiesEnabled]).
+/// - Response headers are single-valued and the core does NOT comma-join
+///   repeated ones: HTTP/3 keeps the first value it saw, the TCP fallback keeps
+///   the last. `set-cookie` is the exception and is handled below.
+/// - `set-cookie` is comma-joined into [http.BaseResponse.headers], which is
+///   what `package:http`'s own `IOClient` does — multiple cookies are ambiguous
+///   there by `package:http`'s design, not Vane's. Splitting the joined value
+///   on `,` is wrong: an `Expires` attribute contains one. Use
+///   [http.BaseResponse.headersSplitValues], whose `set-cookie` splitter
+///   accounts for that, or [VaneResponse.setCookie] for the lossless list.
+/// - Those `set-cookie` values are raw and unfiltered — a cookie Vane's own
+///   jar refused (a `Domain` that is a public suffix, or an IP literal) still
+///   appears among them. Feeding them straight into a third-party cookie store
+///   re-admits what Vane deliberately rejected.
+/// - The negotiated protocol ([VaneResponse.httpVersion]) is not exposed:
+///   [http.BaseResponse] has no field for it. Use [VaneClient] directly, or the
+///   dio adapter, which puts it in `Response.extra`.
 /// - The FFI response carries no reason phrase and no redirect chain, so
 ///   [http.StreamedResponse.reasonPhrase] and `isRedirect` are left unset and
 ///   [http.BaseRequest.maxRedirects] is ignored.
@@ -35,7 +45,10 @@ import 'vane_flutter.dart';
 ///   client-wide Vane setting, not a per-request one.
 ///
 /// [http.Abortable.abortTrigger] is honored: it is wired to a Vane cancel
-/// token and surfaces as [http.RequestAbortedException].
+/// token and surfaces as [http.RequestAbortedException]. An abort landing
+/// before the token has registered with the core is latched and replayed at
+/// registration, so the native request is stopped rather than run to
+/// completion.
 class VaneHttpClient extends http.BaseClient {
   /// Creates an adapter. Pass [client] to share an existing [VaneClient] — its
   /// configuration, interceptors and connection pool — in which case [close]
@@ -125,7 +138,15 @@ class VaneHttpClient extends http.BaseClient {
         response.statusCode,
         contentLength: response.body.length,
         request: request,
-        headers: response.headers,
+        headers: response.setCookie.isEmpty
+            ? response.headers
+            // A new map: the FFI one may be const. Comma-joined because
+            // BaseResponse.headers is Map<String, String> — the same lossy
+            // thing package:http's own IOClient does.
+            : <String, String>{
+                ...response.headers,
+                'set-cookie': response.setCookie.join(','),
+              },
       );
     } finally {
       await token?.dispose();

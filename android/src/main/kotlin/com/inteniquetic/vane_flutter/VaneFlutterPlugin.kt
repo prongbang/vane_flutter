@@ -158,7 +158,13 @@ class VaneFlutterPlugin : FlutterPlugin, MethodCallHandler {
             "body" to body,
             "bodyFilePath" to bodyFilePath,
             "isSuccess" to isSuccess,
-            "url" to url
+            "url" to url,
+            // Kept at parity with the FFI path: a field present on one Flutter
+            // transport and absent on the other only reproduces on some setups.
+            // Raw and unfiltered — a cookie Vane's own jar refused (a
+            // public-suffix Domain, or an IP literal) still appears here.
+            "setCookie" to setCookie,
+            "httpVersion" to httpVersion?.name?.lowercase()
         )
     }
 

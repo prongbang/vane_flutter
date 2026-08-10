@@ -191,6 +191,8 @@ class VaneResponse {
     this.bodyFilePath,
     required this.isSuccess,
     required this.url,
+    this.setCookie = const <String>[],
+    this.httpVersion,
   });
 
   final int statusCode;
@@ -199,6 +201,18 @@ class VaneResponse {
   final String? bodyFilePath;
   final bool isSuccess;
   final String url;
+
+  /// Raw `Set-Cookie` values from the final response, in wire order.
+  ///
+  /// Unfiltered: a cookie Vane's own jar refused still appears here, because
+  /// this reports what the server sent. Never present in [headers] — a
+  /// `Map<String, String>` cannot hold repeats and `Set-Cookie` values contain
+  /// commas, so they cannot be joined losslessly.
+  final List<String> setCookie;
+
+  /// Protocol that served the final response, or `null` when no exchange
+  /// completed or the transport could not say.
+  final VaneHttpVersion? httpVersion;
 
   String get text => utf8.decode(body, allowMalformed: true);
 
@@ -226,9 +240,28 @@ class VaneResponse {
       bodyFilePath: map['bodyFilePath'] as String?,
       isSuccess: map['isSuccess'] as bool? ?? false,
       url: map['url'] as String? ?? '',
+      // Read defensively: an older plugin sends neither key, and the defaults
+      // are exactly what it used to mean.
+      setCookie:
+          (map['setCookie'] as List<Object?>?)
+              ?.map((value) => value.toString())
+              .toList(growable: false) ??
+          const <String>[],
+      httpVersion: VaneHttpVersion.values
+          .where((version) => version.name == map['httpVersion'])
+          .firstOrNull,
     );
   }
 }
+
+/// Protocol a response was actually served over, as opposed to the
+/// [VaneProtocolMode] the request asked for.
+///
+/// The ordinals are the ABI: they mirror `VaneHttpVersion::ffi_code` in the
+/// Rust core (offset by one, since 0 there means "not known" and is `null`
+/// here) and arrive in `VaneFfiResponse.http_version`. Append only, never
+/// reorder. A code this build does not know decodes as `null`.
+enum VaneHttpVersion { http10, http11, http2, http3 }
 
 /// Machine-readable classification of a [VaneHttpException], so callers never
 /// have to match on the core's English error text.
@@ -378,13 +411,33 @@ class VaneProgress {
   final bool done;
 }
 
+/// Cancels an in-flight request.
+///
+/// Caller-owned. Cancelling latches, so a token cancelled before or during a
+/// request aborts that request even if the intent arrived first; [dispose]
+/// clears the latch as well as the native id, so a disposed token is inert and
+/// can be reused. Create one per request and dispose it in a `finally`.
+///
+/// [cancel] may be called before the request starts — including in the same
+/// microtask as the `execute` that will use it. The intent is latched and
+/// replayed the moment the token registers with the core, so the request is
+/// stopped before its first hop rather than running to completion.
 class VaneCancelToken {
   VaneFlutterPlatform? _platform;
   int? _id;
+  bool _cancelled = false;
 
   bool get isStarted => _id != null;
 
+  /// Whether [cancel] has been called, whether or not the core had registered
+  /// the token yet.
+  bool get isCancelled => _cancelled;
+
   Future<void> cancel() async {
+    // Latch first and unconditionally: a cancel that lands before the token
+    // has a native id used to be discarded outright, so the request ran to
+    // completion with its response thrown away.
+    _cancelled = true;
     final id = _id;
     final platform = _platform;
     if (id != null && platform != null) {
@@ -397,6 +450,11 @@ class VaneCancelToken {
     final platform = _platform;
     _id = null;
     _platform = null;
+    // Disarm the latch too. Both adapters dispose in a `finally` after
+    // `execute` has returned or thrown, so the intent has already been
+    // replayed; leaving it set would make a reused token cancel every later
+    // request forever, with no public way to reset it.
+    _cancelled = false;
     if (id != null && platform != null) {
       await platform.freeCancelToken(id);
     }
@@ -708,6 +766,11 @@ class VaneClient {
         cancelToken
           .._platform = _platform
           .._id = await _platform.createCancelToken();
+        // Replay a cancel that landed while the token had no native id, so it
+        // reaches the core before `toMap` snapshots the id below.
+        if (cancelToken._cancelled) {
+          await cancelToken.cancel();
+        }
       }
       if (interceptedRequest.onUploadProgress != null ||
           interceptedRequest.onDownloadProgress != null) {

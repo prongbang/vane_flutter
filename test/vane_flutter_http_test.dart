@@ -60,7 +60,8 @@ class _RecordingPlatform
   Future<int> createCancelToken() async => 1;
 
   @override
-  Future<void> cancelToken(int id) async {}
+  Future<void> cancelToken(int id) async => cancelledTokens.add(id);
+  final List<int> cancelledTokens = <int>[];
 
   @override
   Future<void> freeCancelToken(int id) async {}
@@ -111,6 +112,41 @@ void main() {
     expect(response.headers['content-type'], 'text/plain');
     expect(response.headers['x-multi'], 'a, b');
     expect(response.contentLength, 5);
+    // No set-cookie on this response, so no phantom key either.
+    expect(response.headers, isNot(contains('set-cookie')));
+  });
+
+  test('set-cookie is comma-joined into the headers map', () async {
+    fake.response = VaneResponse(
+      statusCode: 200,
+      headers: const <String, String>{'content-type': 'text/plain'},
+      body: Uint8List(0),
+      isSuccess: true,
+      url: 'https://example.com/thing',
+      // The first value carries an `Expires`, whose comma is what makes the
+      // joined string unsplittable by a naive `split(',')`.
+      setCookie: const <String>[
+        'a=1; Expires=Wed, 09 Jun 2021 10:18:14 GMT',
+        'b=2; Path=/',
+      ],
+    );
+    final client = VaneHttpClient(client: vane);
+
+    final response = await client.get(Uri.parse('https://example.com/thing'));
+
+    // Lossy on purpose: BaseResponse.headers is Map<String, String> and this
+    // is what package:http's own IOClient does. VaneResponse.setCookie is the
+    // lossless path.
+    expect(
+      response.headers['set-cookie'],
+      'a=1; Expires=Wed, 09 Jun 2021 10:18:14 GMT,b=2; Path=/',
+    );
+    // Recoverable, but only through package:http's own set-cookie splitter —
+    // `split(',')` would yield three fragments and strip a=1's expiry.
+    expect(response.headersSplitValues['set-cookie'], <String>[
+      'a=1; Expires=Wed, 09 Jun 2021 10:18:14 GMT',
+      'b=2; Path=/',
+    ]);
   });
 
   test('post sends the finalized body and its content type', () async {
@@ -238,6 +274,7 @@ void main() {
     expect(fake.lastRequest, isNull);
   });
 
+
   test('aborting in flight surfaces as RequestAbortedException', () async {
     final gate = Completer<void>();
     final abort = Completer<void>();
@@ -260,6 +297,7 @@ void main() {
 
     await expectLater(pending, throwsA(isA<http.RequestAbortedException>()));
     expect(fake.lastRequest?['cancelTokenId'], isNotNull);
+    expect(fake.cancelledTokens, <int>[1]);
   });
 
   test(

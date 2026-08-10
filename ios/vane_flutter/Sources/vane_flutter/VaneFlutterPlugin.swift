@@ -242,7 +242,13 @@ private extension VaneResponse {
       "body": FlutterStandardTypedData(bytes: body),
       "bodyFilePath": bodyFilePath as Any,
       "isSuccess": isSuccess,
-      "url": url
+      "url": url,
+      // Kept at parity with the FFI path: a field present on one Flutter
+      // transport and absent on the other only reproduces on some setups.
+      // Raw and unfiltered — a cookie Vane's own jar refused (a public-suffix
+      // Domain, or an IP literal) still appears here.
+      "setCookie": setCookie,
+      "httpVersion": httpVersion.map { "\($0)" } as Any
     ]
   }
 }
