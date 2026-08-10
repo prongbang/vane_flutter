@@ -8,6 +8,13 @@
   completed. The dio adapter now sets `ResponseBody.extraKeyHttpVersion`, and
   the `package:http` adapter comma-joins `set-cookie` into its headers map the
   way `IOClient` does.
+* Behaviour change: a non-cookie response header the server repeated is now
+  comma-joined into one `"a, b"` value (RFC 9110 §5.2), identically on both
+  transports. It previously kept a single value — the first on HTTP/3, the
+  last on the TCP fallback — so which one a caller saw depended on the
+  transport. `package:http`'s `headersSplitValues` and dio's list inflation
+  split the joined value back apart; `set-cookie` stays the
+  `VaneResponse.setCookie` list as before.
 * `VaneCancelToken.cancel()` now latches. A cancel issued before the request
   reached the core used to be discarded, letting the request run to completion
   with its response thrown away; it is now replayed at registration and the

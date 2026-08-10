@@ -21,9 +21,10 @@ import 'vane_flutter.dart';
 /// Known ceilings, all inherited from the core rather than introduced here:
 /// - The core returns a complete response body, so [send] yields it as a single
 ///   chunk. Real chunked streaming needs an incremental read on the Rust side.
-/// - Response headers are single-valued and the core does NOT comma-join
-///   repeated ones: HTTP/3 keeps the first value it saw, the TCP fallback keeps
-///   the last. `set-cookie` is the exception and is handled below.
+/// - Response headers are single-valued: the core comma-joins repeated ones
+///   into one `', '`-separated value (identically on both transports), which
+///   [http.BaseResponse.headersSplitValues] splits back apart. `set-cookie` is
+///   the exception and is handled below.
 /// - `set-cookie` is comma-joined into [http.BaseResponse.headers], which is
 ///   what `package:http`'s own `IOClient` does — multiple cookies are ambiguous
 ///   there by `package:http`'s design, not Vane's. Splitting the joined value
