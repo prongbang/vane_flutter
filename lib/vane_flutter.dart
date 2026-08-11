@@ -653,6 +653,22 @@ class VaneClient {
     await _platform.setCertificatePins(handle, host, pins);
   }
 
+  /// Best-effort warm-up of this client's one-time setup and connection
+  /// cost, so the first real request doesn't pay it — on Android the TCP
+  /// transport's first request otherwise carries ~1 s of trust-store and
+  /// runtime setup. Call it once, early (e.g. right after `runApp`); it
+  /// never throws for network reasons and repeat calls are cheap.
+  ///
+  /// [url] picks the origin to pre-connect (HTTP/3) or probe (TCP); when
+  /// null, the configuration's `baseUrl` is used. With neither, only the
+  /// native client construction is warmed. Creates the native client if this
+  /// one has not made a request yet — that construction is part of what gets
+  /// warmed.
+  Future<void> warmup([String? url]) async {
+    final handle = await _ensureHandle();
+    await _platform.warmup(handle, url);
+  }
+
   Future<void> clearCertificatePins(String host) {
     return setCertificatePins(host, const <String>[]);
   }

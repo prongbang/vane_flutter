@@ -33,6 +33,13 @@ abstract class VaneFlutterPlatform extends PlatformInterface {
     throw UnimplementedError('setCertificatePins() has not been implemented.');
   }
 
+  /// Best-effort warm-up of the client behind [handle]; see
+  /// `VaneClient.warmup`. Defaults to a no-op rather than
+  /// [UnimplementedError]: warmup is a performance affordance whose failures
+  /// are swallowed by contract, so a platform that has not implemented it
+  /// must degrade to "not warmed", never crash an app's startup path.
+  Future<void> warmup(int handle, String? url) async {}
+
   Future<int> createCancelToken() {
     throw UnimplementedError('createCancelToken() has not been implemented.');
   }

@@ -78,7 +78,7 @@ void main() {
           isA<VaneHttpException>().having(
             (e) => e.message,
             'message',
-            allOf(contains('vane_ffi_abi_version'), contains('ABI v1')),
+            allOf(contains('vane_ffi_abi_version'), contains('ABI v2')),
           ),
         ),
       );
@@ -123,7 +123,7 @@ void main() {
             isA<VaneHttpException>().having(
               (e) => e.message,
               'message',
-              allOf(contains('ABI v1'), contains('v999')),
+              allOf(contains('ABI v2'), contains('v999')),
             ),
           ),
         );
@@ -203,6 +203,19 @@ void main() {
         );
 
         await platform.closeClient(based);
+      });
+
+      test('warmup is best-effort and never throws across the FFI', () async {
+        // Unresolvable host: the native side swallows the failure by
+        // contract, so these completing at all is the assertion — of the
+        // symbol, the struct marshalling, and the one-shot isolate hop.
+        await platform
+            .warmup(client, 'https://vane-warmup.invalid/probe')
+            .timeout(const Duration(seconds: 10));
+        // Null url falls back to the (unset) baseUrl.
+        await platform.warmup(client, null).timeout(const Duration(seconds: 10));
+        // An unknown handle warms nothing and still returns.
+        await platform.warmup(999999, null).timeout(const Duration(seconds: 10));
       });
 
       test(

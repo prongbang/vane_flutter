@@ -50,6 +50,13 @@ class MockVaneFlutterPlatform
     }
   }
 
+  final List<(int, String?)> warmupCalls = <(int, String?)>[];
+
+  @override
+  Future<void> warmup(int handle, String? url) async {
+    warmupCalls.add((handle, url));
+  }
+
   int createdCancelTokens = 0;
   final List<int> cancelledTokens = <int>[];
   final List<int> freedCancelTokens = <int>[];
@@ -93,6 +100,25 @@ void main() {
 
   test('$MethodChannelVaneFlutter remains available as a fallback', () {
     expect(MethodChannelVaneFlutter(), isA<MethodChannelVaneFlutter>());
+  });
+
+  test('warmup creates the client and forwards the target url', () async {
+    final fakePlatform = MockVaneFlutterPlatform();
+    VaneFlutterPlatform.instance = fakePlatform;
+
+    final client = VaneClient();
+    await client.warmup();
+    await client.warmup('https://api.example.com');
+
+    // One native client, created by the warmup itself — that construction is
+    // part of what warmup exists to pay early.
+    expect(fakePlatform.createdClients, 1);
+    expect(fakePlatform.warmupCalls, <(int, String?)>[
+      (7, null),
+      (7, 'https://api.example.com'),
+    ]);
+
+    VaneFlutterPlatform.instance = initialPlatform;
   });
 
   test('client executes requests through the platform', () async {

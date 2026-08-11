@@ -242,13 +242,19 @@ typedef _IdActionNative = Void Function(Uint64);
 typedef _IdActionDart = void Function(int);
 typedef _ProgressSnapshotNative = _VaneFfiProgress Function(Uint64);
 typedef _ProgressSnapshotDart = _VaneFfiProgress Function(int);
+typedef _WarmupNative = Void Function(Uint64, _VaneFfiString);
+typedef _WarmupDart = void Function(int, _VaneFfiString);
 
 /// The C ABI version this package's structs and calls were written against.
 /// Rust exports the native side as `vane_ffi_abi_version`; the two must match
 /// exactly, because every `_VaneFfi*` struct here mirrors its Rust layout by
 /// hand and a skewed layout reads garbage — or frees wild pointers —
 /// silently. Bump in lockstep with the Rust constant.
-const int _expectedAbiVersion = 1;
+///
+/// v2: `vane_ffi_client_warmup` — this package binds the symbol, so a v1
+/// library cannot serve it and must be rejected with the clear version
+/// message rather than a symbol-lookup failure.
+const int _expectedAbiVersion = 2;
 
 /// Verifies the native library speaks this package's C ABI, and returns it.
 ///
@@ -382,6 +388,30 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
     List<String> pins,
   ) async {
     _nativeBindings.setCertificatePins(handle, host, pins);
+  }
+
+  @override
+  Future<void> warmup(int handle, String? url) {
+    // The native call blocks for up to the client timeout (runtime and
+    // trust-store setup plus a handshake), so it runs off this isolate. A
+    // one-shot Isolate.run rather than the worker pool: warmup happens about
+    // once per app launch, and the pool's protocol is execute-shaped. Only
+    // the raw symbol pointer can cross the isolate boundary; resolving it
+    // here also means the ABI check has already run.
+    final warmupPointer = _resolvedLibrary
+        .lookup<NativeFunction<_WarmupNative>>('vane_ffi_client_warmup');
+    return Isolate.run(() {
+      final warmup = warmupPointer.asFunction<_WarmupDart>();
+      final nativeUrl = _NativeString(url);
+      final value = calloc<_VaneFfiString>();
+      try {
+        nativeUrl.writeTo(value.ref);
+        warmup(handle, value.ref);
+      } finally {
+        calloc.free(value);
+        nativeUrl.free();
+      }
+    });
   }
 
   @override
