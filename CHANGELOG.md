@@ -1,5 +1,17 @@
 ## Unreleased
 
+* Response-body streaming: `VaneClient.executeStreaming` (and
+  `executeStreaming()` on the request builder) resolves at the final
+  response's headers with a `VaneStreamingResponse` — the usual head plus a
+  single-subscription, demand-driven `Stream<Uint8List>` body. Chunks are
+  pulled from the native transport only as the listener consumes them, so a
+  paused consumer stalls the sender through QUIC/TCP flow control instead of
+  buffering; cancelling the subscription aborts the transfer. Request
+  interceptors run; response/error interceptors and progress callbacks do
+  not apply to the streaming path, and `responseBodyPath` is refused. FFI
+  platform only — the MethodChannel fallback stays buffered by design. The
+  C ABI version this package expects moves 2 → 3: update `libvane` and this
+  package together.
 * `VaneResponse.setCookie` — the raw `Set-Cookie` values from the final
   response, in wire order. Unfiltered: a cookie Vane's own jar refused still
   appears here. Never present in `headers`, which cannot hold repeats.

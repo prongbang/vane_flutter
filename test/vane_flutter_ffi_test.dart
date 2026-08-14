@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
@@ -78,7 +79,7 @@ void main() {
           isA<VaneHttpException>().having(
             (e) => e.message,
             'message',
-            allOf(contains('vane_ffi_abi_version'), contains('ABI v2')),
+            allOf(contains('vane_ffi_abi_version'), contains('ABI v3')),
           ),
         ),
       );
@@ -123,7 +124,7 @@ void main() {
             isA<VaneHttpException>().having(
               (e) => e.message,
               'message',
-              allOf(contains('ABI v2'), contains('v999')),
+              allOf(contains('ABI v3'), contains('v999')),
             ),
           ),
         );
@@ -337,6 +338,51 @@ void main() {
           _failsWithHost('vane-after-inflight.invalid'),
         );
       });
+
+      test(
+        'a streaming request that fails before headers throws, marshalled '
+        'intact, and leaks nothing',
+        () async {
+          // Exercises the whole pump path hermetically: spawn, the blocking
+          // header call through vane_ffi_execute_streaming, the error head
+          // decode, the internally-owned cancel token's release, and the
+          // pump's self-exit. The echoed host proves the request crossed the
+          // new symbol's marshalling.
+          await expectFastFailure(
+            platform.executeStreaming(client, <String, Object?>{
+              'url': 'https://vane-streaming-marker.invalid/probe',
+              'method': 'GET',
+            }),
+            _failsWithHost('vane-streaming-marker.invalid'),
+          );
+
+          // The failure classifies like the buffered path's.
+          await expectFastFailure(
+            platform.executeStreaming(client, <String, Object?>{
+              'url': 'https://vane-streaming-kind.invalid/probe',
+              'method': 'GET',
+            }),
+            _failsWithKind(VaneErrorKind.transport),
+          );
+        },
+      );
+
+      test(
+        'a streaming request refuses responseBodyPath through the real ABI',
+        () async {
+          // Refused by the core before any network is touched, so this is
+          // hermetic — and it proves an InvalidRequest error head round-trips
+          // the new symbol with its kind intact.
+          await expectFastFailure(
+            platform.executeStreaming(client, <String, Object?>{
+              'url': 'https://vane-streaming-path.invalid/probe',
+              'method': 'GET',
+              'responseBodyPath': '/tmp/vane-streaming-refused',
+            }),
+            _failsWithKind(VaneErrorKind.invalidRequest),
+          );
+        },
+      );
 
       test('the http adapter maps a real transport failure', () async {
         final vane = VaneClient(
@@ -579,6 +625,103 @@ void main() {
           expect(response.statusCode, 200);
           expect(response.body, isNotEmpty);
           expect(response.text, isNotEmpty);
+
+          await platform.closeClient(live);
+        },
+      );
+
+      test(
+        'a live streamed body arrives whole, and survives a mid-stream pause',
+        skip: _liveBaseUrl() == null
+            ? 'set VANE_TEST_BASE_URL to an https:// HTTP/3 host'
+            : null,
+        () async {
+          // /drip paces its writes across the duration (one write per byte),
+          // so the body is guaranteed to still be in flight when the pause
+          // lands — but numbytes must stay tiny, because the server really
+          // does write byte by byte. (/bytes/N is no good here: httpbin caps
+          // it at 100 KB and a fast origin delivers that faster than the
+          // pause can land.)
+          const totalBytes = 48;
+          final live = await platform.createClient(<String, Object?>{
+            'baseUrl': _liveBaseUrl(),
+            'timeoutSeconds': 30,
+          });
+          final response = await platform
+              .executeStreaming(live, <String, Object?>{
+                'url': '/drip',
+                'method': 'GET',
+                'queryParams': <String, String>{
+                  'duration': '4',
+                  'numbytes': '$totalBytes',
+                },
+              });
+
+          expect(response.head.statusCode, 200);
+          expect(response.head.body, isEmpty,
+              reason: 'the head carries no body by contract');
+          expect(response.head.httpVersion, VaneHttpVersion.http3);
+
+          final received = BytesBuilder(copy: false);
+          var paused = false;
+          await for (final chunk in response.body) {
+            received.add(chunk);
+            if (!paused && received.length > totalBytes ~/ 4) {
+              paused = true;
+              // await-for keeps the subscription paused across this await:
+              // one second of no demand mid-body. The transfer completing
+              // afterwards is what proves a stalled consumer stalls the
+              // transport instead of erroring or dropping data.
+              await Future<void>.delayed(const Duration(seconds: 1));
+            }
+          }
+          expect(received.length, totalBytes);
+          expect(paused, isTrue,
+              reason: 'the pause must land while the body is in flight');
+
+          await platform.closeClient(live);
+        },
+      );
+
+      test(
+        'cancelling a live streamed body completes promptly and aborts it',
+        skip: _liveBaseUrl() == null
+            ? 'set VANE_TEST_BASE_URL to an https:// HTTP/3 host'
+            : null,
+        () async {
+          final live = await platform.createClient(<String, Object?>{
+            'baseUrl': _liveBaseUrl(),
+            'timeoutSeconds': 30,
+          });
+          // /drip spreads 20 bytes over 8 seconds, so the body is nowhere
+          // near done when the cancel lands and the next read is parked.
+          final response = await platform
+              .executeStreaming(live, <String, Object?>{
+                'url': '/drip',
+                'method': 'GET',
+                'queryParams': <String, String>{
+                  'duration': '8',
+                  'numbytes': '20',
+                },
+              });
+
+          final firstChunk = Completer<void>();
+          final subscription = response.body.listen((chunk) {
+            if (!firstChunk.isCompleted) {
+              firstChunk.complete();
+            }
+          });
+          await firstChunk.future.timeout(const Duration(seconds: 15));
+
+          final stopwatch = Stopwatch()..start();
+          await subscription
+              .cancel()
+              .timeout(const Duration(seconds: 5));
+          stopwatch.stop();
+          // The internally-owned cancel token interrupts the parked read;
+          // waiting out the drip (8s) or the timeout (30s) fails the
+          // timeout above.
+          expect(stopwatch.elapsed, lessThan(const Duration(seconds: 5)));
 
           await platform.closeClient(live);
         },

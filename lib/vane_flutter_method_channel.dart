@@ -4,6 +4,11 @@ import 'package:flutter/services.dart';
 import 'vane_flutter.dart';
 import 'vane_flutter_platform_interface.dart';
 
+/// Channel-based fallback for a host that embeds the core natively instead
+/// of exposing the C ABI. Buffered requests only: `executeStreaming` is
+/// deliberately not implemented here — a demand-driven body cannot ride a
+/// request/response channel (see `VaneFlutterPlatform.executeStreaming`) —
+/// so it throws [UnimplementedError] from the base class.
 class MethodChannelVaneFlutter extends VaneFlutterPlatform {
   @visibleForTesting
   final methodChannel = const MethodChannel('vane_flutter');

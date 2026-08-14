@@ -34,6 +34,29 @@ class MockVaneFlutterPlatform
     );
   }
 
+  Map<String, Object?>? lastStreamingRequest;
+
+  @override
+  Future<VaneStreamingResponse> executeStreaming(
+    int handle,
+    Map<String, Object?> request,
+  ) async {
+    lastStreamingRequest = request;
+    return VaneStreamingResponse(
+      head: VaneResponse(
+        statusCode: 200,
+        headers: const <String, String>{'content-type': 'text/plain'},
+        body: Uint8List(0),
+        isSuccess: true,
+        url: request['url'] as String,
+      ),
+      body: Stream<Uint8List>.fromIterable(<Uint8List>[
+        Uint8List.fromList('str'.codeUnits),
+        Uint8List.fromList('eam'.codeUnits),
+      ]),
+    );
+  }
+
   @override
   Future<void> closeClient(int handle) async {}
 
@@ -372,6 +395,56 @@ void main() {
     await Vane.close();
     VaneFlutterPlatform.instance = initialPlatform;
   });
+
+  test(
+    'executeStreaming runs request interceptors and registers the cancel '
+    'token, but keeps response interceptors away from the stream',
+    () async {
+      final fakePlatform = MockVaneFlutterPlatform();
+      var responseInterceptorRuns = 0;
+      final client = VaneClient(platform: fakePlatform)
+        ..addRequestInterceptor(
+          (request) => request.copyWith(
+            headers: <String, String>{...request.headers, 'x-shaped': '1'},
+          ),
+        )
+        ..addResponseInterceptor((response) {
+          responseInterceptorRuns += 1;
+          return response;
+        });
+
+      final token = VaneCancelToken();
+      final response = await client
+          .request('https://example.com/stream')
+          .cancelToken(token)
+          .executeStreaming();
+
+      expect(fakePlatform.lastStreamingRequest?['url'],
+          'https://example.com/stream');
+      expect(
+        (fakePlatform.lastStreamingRequest?['headers']
+            as Map<String, String>?)?['x-shaped'],
+        '1',
+        reason: 'request interceptors shape streaming requests too',
+      );
+      expect(fakePlatform.createdCancelTokens, 1);
+      expect(fakePlatform.lastStreamingRequest?['cancelTokenId'], 11);
+
+      expect(response.head.statusCode, 200);
+      expect(response.head.body, isEmpty);
+      final body = await response.body.toList();
+      expect(String.fromCharCodes(body.expand((chunk) => chunk)), 'stream');
+      expect(
+        responseInterceptorRuns,
+        0,
+        reason: 'a buffered-response interceptor cannot rewrite a stream; '
+            'the streaming path deliberately skips them',
+      );
+
+      await token.dispose();
+      await client.close();
+    },
+  );
 
   test('VaneResponse.fromMap reads the new keys and defaults without them', () {
     final full = VaneResponse.fromMap(<Object?, Object?>{

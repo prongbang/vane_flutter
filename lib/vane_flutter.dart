@@ -254,6 +254,31 @@ class VaneResponse {
   }
 }
 
+/// A response whose headers have arrived and whose body is still streaming.
+///
+/// [head] is the familiar [VaneResponse] — status, headers, final URL,
+/// cookies, negotiated protocol — with [VaneResponse.body] empty by contract:
+/// [body] delivers it instead.
+///
+/// [body] is single-subscription and demand-driven: chunks are pulled off the
+/// native transport only as the listener consumes them, so pausing the
+/// subscription stalls the sender through QUIC/TCP flow control instead of
+/// buffering without bound (overshoot is bounded at the one pull already in
+/// flight). Chunk boundaries carry no meaning. A failure after the headers
+/// surfaces as an error on this stream, not as a failed request. Cancelling
+/// the subscription aborts the transfer and discards the connection; the
+/// cancel future completes once the native side has let go, which on a
+/// silent TCP stream can take up to the read-inactivity budget.
+///
+/// Always listen to (or cancel) [body]: an abandoned, never-listened body
+/// keeps its connection and its pump isolate until the process ends.
+class VaneStreamingResponse {
+  const VaneStreamingResponse({required this.head, required this.body});
+
+  final VaneResponse head;
+  final Stream<Uint8List> body;
+}
+
 /// Protocol a response was actually served over, as opposed to the
 /// [VaneProtocolMode] the request asked for.
 ///
@@ -856,6 +881,47 @@ class VaneClient {
     }
   }
 
+  /// Like [execute], but resolves as soon as the final response's headers are
+  /// in, with the body left to stream; see [VaneStreamingResponse].
+  ///
+  /// Everything up to the headers behaves exactly like [execute]: the same
+  /// redirect chain, retry policy, HTTP/3-to-TCP fallback, cookies, pins and
+  /// deadline. Differences, all deliberate:
+  ///
+  /// - Request interceptors run; response and error interceptors do NOT — an
+  ///   interceptor written against a buffered [VaneResponse] cannot rewrite a
+  ///   body that has not arrived. Validate status off the head, e.g.
+  ///   `response.head.validateStatus()`.
+  /// - [VaneRequest.responseBodyPath] is refused by the core: the stream
+  ///   replaces the file escape hatch.
+  /// - Progress callbacks are ignored: the chunks themselves are the
+  ///   download progress.
+  /// - [VaneRequest.cancelToken] composes: cancelling it aborts the header
+  ///   phase, or fails the body stream mid-flight. Cancelling the body
+  ///   subscription cancels it too. When no token is given, the platform
+  ///   runs one internally so cancellation stays prompt.
+  Future<VaneStreamingResponse> executeStreaming(VaneRequest request) async {
+    var interceptedRequest = request;
+    for (final interceptor in List<VaneRequestInterceptor>.of(
+      _requestInterceptors,
+    )) {
+      interceptedRequest = await interceptor(interceptedRequest);
+    }
+    final handle = await _ensureHandle();
+    final cancelToken = interceptedRequest.cancelToken;
+    if (cancelToken != null && cancelToken._id == null) {
+      cancelToken
+        .._platform = _platform
+        .._id = await _platform.createCancelToken();
+      // Replay a cancel that landed while the token had no native id, same
+      // as [execute].
+      if (cancelToken._cancelled) {
+        await cancelToken.cancel();
+      }
+    }
+    return _platform.executeStreaming(handle, interceptedRequest.toMap());
+  }
+
   /// Closes the native client. The instance is spent afterwards: further
   /// requests throw a [StateError] rather than quietly opening a new one.
   Future<void> close() async {
@@ -1062,6 +1128,11 @@ class VaneRequestBuilder {
   }
 
   Future<VaneResponse> execute() => _client.execute(_request);
+
+  /// Executes with a streamed response body; see
+  /// [VaneClient.executeStreaming] for how this differs from [execute].
+  Future<VaneStreamingResponse> executeStreaming() =>
+      _client.executeStreaming(_request);
 
   Future<VaneResponse> validateStatus([int min = 200, int max = 299]) async {
     return (await execute()).validateStatus(min, max);

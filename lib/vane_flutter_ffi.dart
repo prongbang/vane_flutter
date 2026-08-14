@@ -198,6 +198,21 @@ final class _VaneFfiProgress extends Struct {
   external bool done;
 }
 
+/// One blocking pull off a response stream; mirrors `VaneFfiStreamChunk`.
+/// Exactly one of three shapes: a body chunk (both flags clear), end of body
+/// ([eof]), or a terminal failure ([error] non-empty, [errorKind] set). The
+/// caller owns and frees whichever buffers came back non-empty.
+final class _VaneFfiStreamChunk extends Struct {
+  external _VaneFfiBuffer body;
+  external _VaneFfiBuffer error;
+
+  @Uint32()
+  external int errorKind;
+
+  @Bool()
+  external bool eof;
+}
+
 typedef _ClientCreateNative =
     Uint64 Function(Pointer<_VaneFfiClientConfig>, Pointer<_VaneFfiBuffer>);
 typedef _ClientCreateDart =
@@ -244,6 +259,26 @@ typedef _ProgressSnapshotNative = _VaneFfiProgress Function(Uint64);
 typedef _ProgressSnapshotDart = _VaneFfiProgress Function(int);
 typedef _WarmupNative = Void Function(Uint64, _VaneFfiString);
 typedef _WarmupDart = void Function(int, _VaneFfiString);
+typedef _ExecuteStreamingNative =
+    Pointer<_VaneFfiResponse> Function(
+      Uint64,
+      Pointer<_VaneFfiRequest>,
+      Pointer<Uint8>,
+      Size,
+      Pointer<Uint64>,
+    );
+typedef _ExecuteStreamingDart =
+    Pointer<_VaneFfiResponse> Function(
+      int,
+      Pointer<_VaneFfiRequest>,
+      Pointer<Uint8>,
+      int,
+      Pointer<Uint64>,
+    );
+typedef _StreamReadNative = _VaneFfiStreamChunk Function(Uint64);
+typedef _StreamReadDart = _VaneFfiStreamChunk Function(int);
+typedef _StreamCloseNative = Void Function(Uint64);
+typedef _StreamCloseDart = void Function(int);
 
 /// The C ABI version this package's structs and calls were written against.
 /// Rust exports the native side as `vane_ffi_abi_version`; the two must match
@@ -254,7 +289,12 @@ typedef _WarmupDart = void Function(int, _VaneFfiString);
 /// v2: `vane_ffi_client_warmup` — this package binds the symbol, so a v1
 /// library cannot serve it and must be rejected with the clear version
 /// message rather than a symbol-lookup failure.
-const int _expectedAbiVersion = 2;
+///
+/// v3: response-body streaming — `vane_ffi_execute_streaming`,
+/// `vane_ffi_stream_read`, `vane_ffi_stream_close` and the
+/// `VaneFfiStreamChunk` struct this package mirrors as
+/// [_VaneFfiStreamChunk].
+const int _expectedAbiVersion = 3;
 
 /// Verifies the native library speaks this package's C ABI, and returns it.
 ///
@@ -373,6 +413,39 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
       }
       rethrow;
     }
+  }
+
+  /// One pump isolate per stream, spawned here and owned by the returned
+  /// body: the worker pool stays free for ordinary requests, and the pump's
+  /// single-read-per-demand protocol is what keeps a slow consumer from
+  /// buffering on the Dart side (see [StreamBodyController]).
+  ///
+  /// Not profiled: DevTools recording is built around buffered
+  /// request/response pairs; wiring a live body into it is future work.
+  @override
+  Future<VaneStreamingResponse> executeStreaming(
+    int handle,
+    Map<String, Object?> request,
+  ) {
+    var tokenId = (request['cancelTokenId'] as int?) ?? 0;
+    var ownsToken = false;
+    if (tokenId == 0) {
+      // A streaming request always runs with a cancel token: cancelling the
+      // token is what interrupts a pull blocked inside the native read when
+      // the consumer cancels — close alone would wait the read out. Owned
+      // here and freed when the pump finishes.
+      tokenId = _nativeBindings.createCancelToken();
+      ownsToken = true;
+      request = <String, Object?>{...request, 'cancelTokenId': tokenId};
+    }
+    return _VaneStreamPump(
+      _nativeBindings,
+      _resolvedLibrary,
+      handle,
+      request,
+      cancelTokenId: tokenId,
+      ownsCancelToken: ownsToken,
+    ).start();
   }
 
   @override
@@ -651,6 +724,412 @@ class _VaneWorker {
         responses.send((id, 0, error.toString(), stackTrace.toString()));
       } finally {
         nativeRequest?.free();
+      }
+    });
+  }
+}
+
+/// The demand side of a streamed response body: turns the single listener's
+/// listen/pause/resume/cancel signals into single-pull requests against a
+/// pump that runs exactly one blocking native read per request.
+///
+/// The whole value of this class is the discipline [_maybeRequest] encodes:
+/// at most ONE pull in flight, and none while the consumer is paused, gone,
+/// or the stream has ended. An eager loop here would look identical on a
+/// demo and buffer without bound in production, silently defeating the
+/// transport backpressure the core's pull design exists to provide —
+/// `test/vane_flutter_stream_pump_test.dart` is written to fail if that
+/// regresses. Overshoot is bounded at one chunk: a pull already in flight
+/// when the consumer pauses cannot be un-issued, so its result is buffered
+/// by the controller and delivered on resume.
+///
+/// Public only for that test; everything else reaches streaming through
+/// [FfiVaneFlutter.executeStreaming].
+@visibleForTesting
+final class StreamBodyController {
+  StreamBodyController({
+    required this._onDemand,
+    required this._onShutdown,
+  }) {
+    _controller = StreamController<Uint8List>(
+      onListen: _maybeRequest,
+      onResume: _maybeRequest,
+      // No onPause body: not requesting is the entire reaction to a pause.
+      onCancel: _cancel,
+    );
+  }
+
+  /// Ask the pump for exactly one chunk. Never called with one outstanding.
+  final void Function() _onDemand;
+
+  /// Tear the native stream down. `abort` is true only when a live stream is
+  /// being cancelled by the consumer — that is the case that must interrupt
+  /// a blocked read via the cancel token; after EOF or an error there is
+  /// nothing to interrupt and the caller's token must NOT be cancelled by a
+  /// normal end of stream.
+  final Future<void> Function({required bool abort}) _onShutdown;
+
+  late final StreamController<Uint8List> _controller;
+
+  /// One pull requested and not yet answered.
+  bool _pullInFlight = false;
+
+  /// The native side finished (EOF or terminal error) on its own.
+  bool _terminal = false;
+
+  /// Set by the first cancel; replayed to every later one.
+  Future<void>? _shutdown;
+
+  /// Single-subscription body stream handed to the caller.
+  Stream<Uint8List> get stream => _controller.stream;
+
+  void _maybeRequest() {
+    if (_pullInFlight ||
+        _terminal ||
+        _shutdown != null ||
+        !_controller.hasListener ||
+        _controller.isPaused) {
+      return;
+    }
+    _pullInFlight = true;
+    _onDemand();
+  }
+
+  /// Runs on explicit subscription cancel AND implicitly after the done
+  /// event that [addEof]/[addFailure] deliver — hence the `_terminal` guard
+  /// deciding whether this is an abort or ordinary cleanup.
+  Future<void> _cancel() => _shutdown ??= _onShutdown(abort: !_terminal);
+
+  /// A pull came back with a body chunk.
+  void addChunk(Uint8List bytes) {
+    _pullInFlight = false;
+    if (_terminal || _shutdown != null) {
+      // The result of a pull that was in flight when the consumer cancelled:
+      // nobody is listening, drop it.
+      return;
+    }
+    _controller.add(bytes);
+    // If the consumer paused while the pull was in flight this requests
+    // nothing — the chunk above is the single buffered overshoot.
+    _maybeRequest();
+  }
+
+  /// A pull came back with end-of-body.
+  void addEof() {
+    _pullInFlight = false;
+    if (_terminal || _shutdown != null) {
+      return;
+    }
+    _terminal = true;
+    _controller.close();
+  }
+
+  /// A pull came back with a terminal failure, or the pump itself died.
+  void addFailure(VaneHttpException error) {
+    _pullInFlight = false;
+    if (_terminal || _shutdown != null) {
+      // Typically the `Cancelled` error of the read the consumer's own
+      // cancel interrupted; the consumer asked for that, so it is not news.
+      return;
+    }
+    _terminal = true;
+    _controller
+      ..addError(error)
+      ..close();
+  }
+}
+
+/// Owns one stream's pump isolate: spawns it, decodes its messages into a
+/// [StreamBodyController], and tears it down exactly once. One instance per
+/// streaming request, alive for the stream's lifetime.
+class _VaneStreamPump {
+  _VaneStreamPump(
+    this._bindings,
+    DynamicLibrary library,
+    int clientHandle,
+    Map<String, Object?> request, {
+    required this._cancelTokenId,
+    required this._ownsCancelToken,
+  }) {
+    _responses.listen(_onMessage);
+    Isolate.spawn(
+      _pumpMain,
+      (
+        _responses.sendPort,
+        library.lookup<NativeFunction<_ExecuteStreamingNative>>(
+          'vane_ffi_execute_streaming',
+        ),
+        library.lookup<NativeFunction<_StreamReadNative>>(
+          'vane_ffi_stream_read',
+        ),
+        library.lookup<NativeFunction<_StreamCloseNative>>(
+          'vane_ffi_stream_close',
+        ),
+        library.lookup<NativeFunction<_BufferFreeNative>>(
+          'vane_ffi_buffer_free',
+        ),
+        clientHandle,
+        request,
+      ),
+      // Without these a pump that dies leaves the body stream (and any
+      // cancel) waiting forever.
+      onExit: _responses.sendPort,
+      onError: _responses.sendPort,
+    ).then((_) {}, onError: _onSpawnError);
+    // No Isolate handle is kept: the pump is never killed from outside — it
+    // exits by protocol ('close', or a failed header phase), and a blocked
+    // read is interrupted through the cancel token, not by killing an
+    // isolate mid-FFI-call.
+  }
+
+  final _VaneFfiBindings _bindings;
+  final int _cancelTokenId;
+  final bool _ownsCancelToken;
+  final ReceivePort _responses = ReceivePort();
+  final Completer<(int, int)> _head = Completer<(int, int)>();
+  final Completer<void> _closed = Completer<void>();
+  SendPort? _commands;
+  StreamBodyController? _body;
+  bool _finished = false;
+
+  /// Completes with the decoded head once the header phase is done, wiring
+  /// the body stream up on success and tearing the pump down on failure.
+  Future<VaneStreamingResponse> start() async {
+    final (address, streamHandle) = await _head.future;
+    try {
+      final head = _bindings.readResponse(address);
+      if (streamHandle == 0) {
+        // Unreachable by the ABI contract (success implies a handle);
+        // refuse loudly rather than hand out a body that can never pump.
+        throw const VaneHttpException(
+          'Native Vane streaming returned no stream handle.',
+        );
+      }
+      final body = StreamBodyController(
+        onDemand: _requestRead,
+        onShutdown: _shutdown,
+      );
+      _body = body;
+      return VaneStreamingResponse(head: head, body: body.stream);
+    } catch (error) {
+      // The request failed at or before the headers: the pump exits on its
+      // own (stream handle 0 ends it), which completes [_closed] via onExit;
+      // waiting on that is what makes token release safe here.
+      await _shutdown(abort: false);
+      rethrow;
+    }
+  }
+
+  void _requestRead() {
+    _commands?.send('read');
+  }
+
+  Future<void> _shutdown({required bool abort}) {
+    if (abort && _cancelTokenId != 0) {
+      // Interrupt a pull blocked inside the native read; without this,
+      // close would wait it out (H3 notices within its socket tick, TCP at
+      // the next chunk or its inactivity budget — that bound is documented
+      // on VaneStreamingResponse).
+      _bindings.cancelToken(_cancelTokenId);
+    }
+    // Queues behind an in-flight read on the pump's mailbox, which is
+    // exactly the serialization close needs. Dropped harmlessly if the pump
+    // already exited; [_closed] then completes through onExit instead of
+    // the 'closed' reply.
+    _commands?.send('close');
+    return _closed.future;
+  }
+
+  /// Exactly-once teardown of the Dart-side resources.
+  void _finish() {
+    if (_finished) {
+      return;
+    }
+    _finished = true;
+    _responses.close();
+    if (_ownsCancelToken) {
+      _bindings.freeCancelToken(_cancelTokenId);
+    }
+  }
+
+  void _onSpawnError(Object error, StackTrace stackTrace) {
+    _onMessage(<Object?>[error.toString(), stackTrace.toString()]);
+  }
+
+  void _onMessage(Object? message) {
+    if (message == null || message is List) {
+      // onExit sends null, onError sends [error, stackTrace]. For a pump
+      // that exited by protocol ('closed', or a failed header phase) this
+      // is routine cleanup; for one that died mid-stream it is the only
+      // thing standing between the consumer and a stream that never ends.
+      final error = VaneHttpException(
+        message is List
+            ? 'Vane stream pump isolate died: ${message.first}'
+            : 'Vane stream pump isolate exited unexpectedly.',
+      );
+      if (!_head.isCompleted) {
+        _head.completeError(
+          error,
+          message is List && message.length > 1
+              ? StackTrace.fromString('${message[1]}')
+              : StackTrace.empty,
+        );
+      }
+      _body?.addFailure(error);
+      if (!_closed.isCompleted) {
+        _closed.complete();
+      }
+      _finish();
+      return;
+    }
+    switch (message) {
+      case 'closed':
+        if (!_closed.isCompleted) {
+          _closed.complete();
+        }
+        _finish();
+      case 'eof':
+        _body?.addEof();
+      case (
+        'head',
+        final int address,
+        final int streamHandle,
+        final SendPort commands,
+        final String? error,
+        final String? stackTrace,
+      ):
+        _commands = commands;
+        if (error != null) {
+          _head.completeError(
+            VaneHttpException(error),
+            StackTrace.fromString(stackTrace ?? ''),
+          );
+        } else {
+          _head.complete((address, streamHandle));
+        }
+      case ('chunk', final TransferableTypedData data):
+        _body?.addChunk(data.materialize().asUint8List());
+      case ('error', final String text, final int kind):
+        _body?.addFailure(VaneHttpException(text, kind: _errorKind(kind)));
+      default:
+        // A message shape this build does not know cannot happen without a
+        // bug in this file; dropping it beats crashing the app over it.
+        assert(false, 'unknown Vane stream pump message: $message');
+    }
+  }
+
+  /// Runs on the pump isolate. One stream, three phases: the blocking header
+  /// call, then one blocking `vane_ffi_stream_read` per 'read' command, then
+  /// `vane_ffi_stream_close` on 'close' and exit.
+  ///
+  /// The demand decision — when to send 'read' — lives entirely in
+  /// [StreamBodyController] on the calling isolate. This side is
+  /// deliberately incapable of running ahead: there is no loop here, only
+  /// one reply per command.
+  static void _pumpMain(
+    (
+      SendPort,
+      Pointer<NativeFunction<_ExecuteStreamingNative>>,
+      Pointer<NativeFunction<_StreamReadNative>>,
+      Pointer<NativeFunction<_StreamCloseNative>>,
+      Pointer<NativeFunction<_BufferFreeNative>>,
+      int,
+      Map<String, Object?>,
+    )
+    init,
+  ) {
+    final (
+      responses,
+      executePointer,
+      readPointer,
+      closePointer,
+      freePointer,
+      clientHandle,
+      request,
+    ) = init;
+    final commands = ReceivePort();
+    var address = 0;
+    var streamHandle = 0;
+    String? error;
+    String? stackTrace;
+    _NativeRequest? nativeRequest;
+    final outStream = calloc<Uint64>();
+    try {
+      nativeRequest = _NativeRequest(request);
+      final response = executePointer.asFunction<_ExecuteStreamingDart>()(
+        clientHandle,
+        nativeRequest.pointer,
+        nativeRequest.body.pointer,
+        nativeRequest.body.length,
+        outStream,
+      );
+      address = response.address;
+      streamHandle = outStream.value;
+    } catch (caught, caughtStack) {
+      // Strings only, like the worker: an unsendable error object thrown
+      // while reporting a failure would kill the pump silently.
+      error = caught.toString();
+      stackTrace = caughtStack.toString();
+    } finally {
+      calloc.free(outStream);
+      nativeRequest?.free();
+    }
+    responses.send((
+      'head',
+      address,
+      streamHandle,
+      commands.sendPort,
+      error,
+      stackTrace,
+    ));
+    if (streamHandle == 0) {
+      // Failed at or before the headers: there is no stream to pump. The
+      // isolate's exit is the calling side's cleanup signal.
+      commands.close();
+      return;
+    }
+    final read = readPointer.asFunction<_StreamReadDart>();
+    final close = closePointer.asFunction<_StreamCloseDart>();
+    final bufferFree = freePointer.asFunction<_BufferFreeDart>();
+    commands.listen((Object? command) {
+      if (command == 'close') {
+        // Frees the native handle too; safe after EOF or an error.
+        close(streamHandle);
+        responses.send('closed');
+        commands.close();
+        return;
+      }
+      // 'read': one blocking pull. Everything inside the try, so a decode
+      // failure reports as a stream error instead of killing the isolate.
+      try {
+        final chunk = read(streamHandle);
+        final failure = chunk.error;
+        if (failure.data != nullptr && failure.len > 0) {
+          final text = utf8.decode(failure.data.asTypedList(failure.len));
+          final kind = chunk.errorKind;
+          bufferFree(chunk.error);
+          bufferFree(chunk.body);
+          responses.send(('error', text, kind));
+        } else if (chunk.eof) {
+          bufferFree(chunk.body);
+          bufferFree(chunk.error);
+          responses.send('eof');
+        } else {
+          final body = chunk.body;
+          // One copy, native to Dart; the transfer to the calling isolate
+          // is then free instead of a second copy.
+          final bytes = TransferableTypedData.fromList(<Uint8List>[
+            if (body.data != nullptr && body.len > 0)
+              body.data.asTypedList(body.len)
+            else
+              Uint8List(0),
+          ]);
+          bufferFree(chunk.body);
+          bufferFree(chunk.error);
+          responses.send(('chunk', bytes));
+        }
+      } catch (caught) {
+        responses.send(('error', caught.toString(), 0));
       }
     });
   }

@@ -25,6 +25,23 @@ abstract class VaneFlutterPlatform extends PlatformInterface {
     throw UnimplementedError('execute() has not been implemented.');
   }
 
+  /// Executes [request], resolving at the final response's headers with the
+  /// body left to stream; see `VaneClient.executeStreaming`.
+  ///
+  /// Only the FFI platform implements this. The MethodChannel fallback
+  /// deliberately does not: streaming's backpressure contract — one native
+  /// pull per unit of listener demand — cannot be expressed over a
+  /// request/response channel without an EventChannel protocol plus an
+  /// ack-per-chunk scheme, and every supported platform already gets the
+  /// FFI implementation by default. On the fallback, use [execute]'s
+  /// buffered response instead.
+  Future<VaneStreamingResponse> executeStreaming(
+    int handle,
+    Map<String, Object?> request,
+  ) {
+    throw UnimplementedError('executeStreaming() has not been implemented.');
+  }
+
   Future<void> closeClient(int handle) {
     throw UnimplementedError('closeClient() has not been implemented.');
   }
