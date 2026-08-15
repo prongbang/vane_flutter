@@ -5,6 +5,7 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'package:ffi/ffi.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http_profile/http_profile.dart';
@@ -42,6 +43,18 @@ String? _liveBaseUrl() {
     return null;
   }
   return base;
+}
+
+/// Test-side mirror of the C ABI's `VaneFfiBuffer`, for probing the body
+/// stream registry directly (the plugin's own struct is private).
+final class _ProbeBuffer extends Struct {
+  external Pointer<Uint8> data;
+
+  @Size()
+  external int len;
+
+  @Size()
+  external int cap;
 }
 
 Matcher _failsWithHost(String host) {
@@ -829,6 +842,100 @@ void main() {
           }
 
           await platform.closeClient(live);
+        },
+      );
+
+      test(
+        'aborting a parked upload frees the native stream directly from '
+        'this isolate, never through the writer mailbox',
+        () async {
+          // Pins the invariant that lives in [FfiVaneFlutter.startUpload]'s
+          // `onFree` closure — the layer the driver unit tests cannot reach,
+          // because they substitute their own `onFree`. Here the REAL
+          // closure runs against the REAL registry: four 64 KiB chunks fill
+          // the core's 256 KiB buffer exactly, the fifth write enters the
+          // real `vane_ffi_body_stream_write` on the writer isolate and
+          // parks (nothing consumes an unattached stream). The abort is
+          // [UploadStreamDriver.dispose] — the exact call [execute]'s
+          // finally makes when the request settles, and the only abort that
+          // can reach a parked upload at all: the subscription is paused
+          // during a write, so a source error is buffered undelivered until
+          // the write acks. The registry itself is the witness: after the
+          // dispose, `vane_ffi_body_stream_finish` on the id must report it
+          // unknown — the direct free from this isolate already removed it.
+          // A refactor that routes the free through the writer's mailbox
+          // queues it behind the parked write forever; the id stays live,
+          // finish returns Ok, and the assertion below fails.
+          final probeLibrary = DynamicLibrary.open(libraryPath!);
+          final probeFinish = probeLibrary.lookupFunction<
+            Uint32 Function(Uint64, Pointer<_ProbeBuffer>),
+            int Function(int, Pointer<_ProbeBuffer>)
+          >('vane_ffi_body_stream_finish');
+          final probeFree = probeLibrary
+              .lookupFunction<Void Function(Uint64), void Function(int)>(
+                'vane_ffi_body_stream_free',
+              );
+          final probeBufferFree = probeLibrary
+              .lookupFunction<
+                Void Function(_ProbeBuffer),
+                void Function(_ProbeBuffer)
+              >('vane_ffi_buffer_free');
+
+          final controller = StreamController<Uint8List>();
+          final upload = platform.startUpload(<String, Object?>{
+            'url': 'https://upload.invalid/never-sent',
+            'method': 'POST',
+            'bodyStream': controller.stream,
+          });
+          expect(upload, isNotNull, reason: 'a bodyStream must start an upload');
+          final id = upload!.request['bodyStreamId']! as int;
+          expect(id, isNot(0));
+          expect(
+            upload.request.containsKey('bodyStream'),
+            isFalse,
+            reason: 'the unsendable Stream must be stripped from the map',
+          );
+
+          for (var chunk = 0; chunk < 5; chunk += 1) {
+            controller.add(Uint8List(64 * 1024));
+          }
+          // Generous settle: isolate spawn plus four sub-millisecond native
+          // writes plus the fifth entering its park. The discriminator only
+          // needs the fifth write to be in flight when the abort lands.
+          await Future<void>.delayed(const Duration(milliseconds: 1500));
+
+          upload.driver.dispose();
+          // The free is synchronous inside the driver's stop, so the
+          // registry entry is gone before dispose returns; done latches in
+          // the same call.
+          await upload.driver.done.timeout(const Duration(seconds: 2));
+
+          final probeError = calloc<_ProbeBuffer>();
+          try {
+            probeFinish(id, probeError);
+            final length = probeError.ref.len;
+            final message = length == 0
+                ? ''
+                : utf8.decode(probeError.ref.data.asTypedList(length));
+            if (length != 0) {
+              probeBufferFree(probeError.ref);
+            }
+            expect(
+              message,
+              contains('Unknown body stream id'),
+              reason:
+                  'the id must already be gone: onFree calls freeBodyStream '
+                  'directly from this isolate while the writer is still '
+                  'parked in its write — a mailbox-routed free would leave '
+                  'the id alive here (finish would return Ok)',
+            );
+          } finally {
+            calloc.free(probeError);
+            // Unwedges a failing mutant's parked writer; a no-op on the
+            // already-freed id the correct implementation leaves behind.
+            probeFree(id);
+          }
+          await controller.close();
         },
       );
     },

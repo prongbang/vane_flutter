@@ -400,7 +400,7 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
     // Extracted before anything else touches the map: a Stream cannot cross
     // the worker isolate boundary, so the upload rides as a native stream id
     // while this isolate pumps the caller's source into it.
-    final upload = _startUpload(request);
+    final upload = startUpload(request);
     if (upload != null) {
       request = upload.request;
     }
@@ -467,7 +467,15 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
   /// [UploadStreamDriver] pumping the caller's source into it. Returns the
   /// map to actually send — the unsendable `Stream` stripped, the native id
   /// in its place — or null when there is nothing to stream.
-  ({Map<String, Object?> request, UploadStreamDriver driver})? _startUpload(
+  ///
+  /// Public only for the teardown-while-parked test in
+  /// `test/vane_flutter_ffi_test.dart`, which pins the `onFree` closure
+  /// below against the real registry: the free must be the DIRECT native
+  /// call from this isolate, and rerouting it through the writer's mailbox
+  /// would queue it behind the very write it must interrupt. Production
+  /// reaches this only through [execute] and [executeStreaming].
+  @visibleForTesting
+  ({Map<String, Object?> request, UploadStreamDriver driver})? startUpload(
     Map<String, Object?> request,
   ) {
     final source = request['bodyStream'];
@@ -489,7 +497,8 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
         // writer may be parked inside the blocked native write, and this
         // free is the only thing that releases it — routing it through the
         // writer's mailbox would queue it behind the very call it must
-        // interrupt.
+        // interrupt. Pinned against the real registry by the
+        // teardown-while-parked test in `test/vane_flutter_ffi_test.dart`.
         _nativeBindings.freeBodyStream(id);
         writer.close();
       },
@@ -516,7 +525,7 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
     // Same extraction as [execute]. The upload driver and the response pump
     // are separate isolates making independent blocking calls, so a request
     // can stream in both directions at once.
-    final upload = _startUpload(request);
+    final upload = startUpload(request);
     if (upload != null) {
       request = upload.request;
     }
