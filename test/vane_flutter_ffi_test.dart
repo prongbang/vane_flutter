@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
@@ -79,7 +80,7 @@ void main() {
           isA<VaneHttpException>().having(
             (e) => e.message,
             'message',
-            allOf(contains('vane_ffi_abi_version'), contains('ABI v3')),
+            allOf(contains('vane_ffi_abi_version'), contains('ABI v4')),
           ),
         ),
       );
@@ -114,17 +115,21 @@ void main() {
       /// The happy path of the guard is the whole group: setUpAll resolved
       /// the library through [verifyNativeAbi], so every test here already
       /// proves an injected, matching library passes. This pins the mismatch
-      /// branch against the real symbol, naming both versions.
+      /// branch against the real symbol, naming both versions — and
+      /// `expected: 3` is not an arbitrary wrong number: it is exactly the
+      /// pairing the v4 struct growth creates (a v3-era plugin loading this
+      /// library), the skew that would misread `VaneFfiRequest` past its end
+      /// if the guard ever stopped firing.
       test('an ABI version mismatch is refused, naming both versions', () {
         final library = DynamicLibrary.open(libraryPath!);
         expect(verifyNativeAbi(library), same(library));
         expect(
-          () => verifyNativeAbi(library, expected: 999),
+          () => verifyNativeAbi(library, expected: 3),
           throwsA(
             isA<VaneHttpException>().having(
               (e) => e.message,
               'message',
-              allOf(contains('ABI v3'), contains('v999')),
+              allOf(contains('ABI v4'), contains('v3')),
             ),
           ),
         );
@@ -380,6 +385,63 @@ void main() {
               'responseBodyPath': '/tmp/vane-streaming-refused',
             }),
             _failsWithKind(VaneErrorKind.invalidRequest),
+          );
+        },
+      );
+
+      test(
+        'a streamed upload whose request fails is released, cleaned up, and '
+        'reports the request error',
+        () async {
+          // Exercises the whole upload chain hermetically against the real
+          // core: create through the new symbol, the id crossing the grown
+          // VaneFfiRequest, the writer isolate's blocking write, the core's
+          // release latch failing the writer when the request dies at DNS,
+          // and the driver's teardown. The echoed host proves the marshalled
+          // request carried the stream id (the core resolved it — an unknown
+          // id would fail with a different message before any connection).
+          final controller = StreamController<Uint8List>();
+          controller.add(Uint8List.fromList(List<int>.filled(1024, 7)));
+          await expectFastFailure(
+            platform.execute(client, <String, Object?>{
+              'url': 'https://vane-upload-marker.invalid/probe',
+              'method': 'POST',
+              'bodyStream': controller.stream,
+            }),
+            _failsWithHost('vane-upload-marker.invalid'),
+          );
+          await controller.close();
+        },
+      );
+
+      test(
+        'a source stream error aborts the upload and outranks the induced '
+        'Cancelled',
+        () async {
+          // The .invalid DNS failure usually loses this race, so give the
+          // request a moment of life: the source errors immediately, the
+          // driver frees the native stream, the core aborts, and whatever
+          // order the race resolves in, the caller must see the source's own
+          // error — never the synthetic Cancelled it induced.
+          final failure = StateError('the app source blew up');
+          await expectFastFailure(
+            platform.execute(client, <String, Object?>{
+              'url': 'https://vane-upload-source-error.invalid/probe',
+              'method': 'POST',
+              'bodyStream': Stream<Uint8List>.error(failure),
+            }),
+            throwsA(
+              anyOf(
+                same(failure),
+                // The DNS failure can genuinely win the race; what must
+                // never surface is the abort-induced Cancelled.
+                isA<VaneHttpException>().having(
+                  (e) => e.kind,
+                  'kind',
+                  isNot(VaneErrorKind.cancelled),
+                ),
+              ),
+            ),
           );
         },
       );
@@ -722,6 +784,49 @@ void main() {
           // waiting out the drip (8s) or the timeout (30s) fails the
           // timeout above.
           expect(stopwatch.elapsed, lessThan(const Duration(seconds: 5)));
+
+          await platform.closeClient(live);
+        },
+      );
+
+      test(
+        'a live streamed upload round-trips, declared and chunked',
+        skip: _liveBaseUrl() == null
+            ? 'set VANE_TEST_BASE_URL to an https:// HTTP/3 host'
+            : null,
+        () async {
+          // /post echoes the body back as `data`, so the assertion proves
+          // the chunks the source produced are the bytes that reached the
+          // server, in order, under both framings the core can send: a
+          // declared Content-Length and no length at all (DATA/FIN on H3).
+          final live = await platform.createClient(<String, Object?>{
+            'baseUrl': _liveBaseUrl(),
+            'timeoutSeconds': 30,
+          });
+          const parts = <String>['vane-', 'streamed-', 'upload'];
+          final payload = parts.join();
+          Stream<Uint8List> source() => Stream<Uint8List>.fromIterable(
+            parts.map((part) => Uint8List.fromList(part.codeUnits)),
+          );
+
+          for (final declared in <int?>[payload.length, null]) {
+            final response = await platform.execute(live, <String, Object?>{
+              'url': '/post',
+              'method': 'POST',
+              'bodyStream': source(),
+              'bodyStreamContentLength': declared,
+            });
+            expect(response.statusCode, 200);
+            expect(response.httpVersion, VaneHttpVersion.http3);
+            final echoed = jsonDecode(response.text) as Map<String, Object?>;
+            expect(
+              echoed['data'],
+              payload,
+              reason: declared == null
+                  ? 'chunked/FIN framing must deliver the body intact'
+                  : 'declared-length framing must deliver the body intact',
+            );
+          }
 
           await platform.closeClient(live);
         },

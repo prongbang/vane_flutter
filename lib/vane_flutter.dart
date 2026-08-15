@@ -115,6 +115,8 @@ class VaneRequest {
     this.queryParams = const <String, String>{},
     this.body,
     this.bodyFilePath,
+    this.bodyStream,
+    this.bodyStreamContentLength,
     this.responseBodyPath,
     this.cancelToken,
     this.onUploadProgress,
@@ -129,6 +131,18 @@ class VaneRequest {
   final Map<String, String> queryParams;
   final Uint8List? body;
   final String? bodyFilePath;
+
+  /// Caller-pushed request body, uploaded as it is produced instead of
+  /// buffered; see [VaneRequestBuilder.bodyStream] for the full contract.
+  /// Mutually exclusive with [body] and [bodyFilePath] (the core refuses the
+  /// combination).
+  final Stream<Uint8List>? bodyStream;
+
+  /// Declared byte count for [bodyStream]: sends `Content-Length` and
+  /// enforces exactly that many bytes. Null sends no length — chunked
+  /// framing on HTTP/1.1, plain DATA/FIN on HTTP/2 and HTTP/3.
+  final int? bodyStreamContentLength;
+
   final String? responseBodyPath;
   final VaneCancelToken? cancelToken;
   final VaneProgressCallback? onUploadProgress;
@@ -143,6 +157,8 @@ class VaneRequest {
     Map<String, String>? queryParams,
     Uint8List? body,
     String? bodyFilePath,
+    Stream<Uint8List>? bodyStream,
+    int? bodyStreamContentLength,
     String? responseBodyPath,
     VaneCancelToken? cancelToken,
     VaneProgressCallback? onUploadProgress,
@@ -157,6 +173,9 @@ class VaneRequest {
       queryParams: queryParams ?? this.queryParams,
       body: body ?? this.body,
       bodyFilePath: bodyFilePath ?? this.bodyFilePath,
+      bodyStream: bodyStream ?? this.bodyStream,
+      bodyStreamContentLength:
+          bodyStreamContentLength ?? this.bodyStreamContentLength,
       responseBodyPath: responseBodyPath ?? this.responseBodyPath,
       cancelToken: cancelToken ?? this.cancelToken,
       onUploadProgress: onUploadProgress ?? this.onUploadProgress,
@@ -174,6 +193,11 @@ class VaneRequest {
       'queryParams': queryParams,
       'body': body,
       'bodyFilePath': bodyFilePath,
+      // The Stream itself: the FFI platform swaps it for a native stream id
+      // before anything crosses an isolate; the MethodChannel platform
+      // refuses it outright.
+      'bodyStream': bodyStream,
+      'bodyStreamContentLength': bodyStreamContentLength,
       'responseBodyPath': responseBodyPath,
       'cancelTokenId': cancelToken?._id,
       'progressId': null,
@@ -989,6 +1013,48 @@ class VaneRequestBuilder {
       headers: _request.headers,
       queryParams: _request.queryParams,
       bodyFilePath: path,
+      responseBodyPath: _request.responseBodyPath,
+      cancelToken: _request.cancelToken,
+      onUploadProgress: _request.onUploadProgress,
+      onDownloadProgress: _request.onDownloadProgress,
+      timeoutSeconds: _request.timeoutSeconds,
+      followRedirects: _request.followRedirects,
+    );
+    return this;
+  }
+
+  /// Streams [stream] as the request body: each chunk is handed to the
+  /// transport as its send window opens, nothing is buffered beyond the one
+  /// chunk in flight, and [stream] is paused (ordinary Dart stream
+  /// backpressure) whenever the network is the bottleneck. Replaces any
+  /// buffered body or body file. Chunk boundaries carry no meaning.
+  ///
+  /// [contentLength] declares and enforces the exact byte count and sends
+  /// `Content-Length`; producing more, or ending short, fails the request.
+  /// Without it the body is chunked on HTTP/1.1 and FIN-delimited on
+  /// HTTP/2 and HTTP/3.
+  ///
+  /// A streamed body is one-shot, so the core disables every replay for
+  /// this request: it never retries regardless of the retry configuration;
+  /// 307/308 (and 301/302 on GET) redirects come back refused, with the 3xx
+  /// response carrying `vane-redirect-refused: streamed-body` (303 still
+  /// follows — the body is dropped and the hop becomes a GET); HTTP/3→TCP
+  /// fallback happens only while no body byte has been consumed; and the
+  /// whole upload must finish within the request timeout.
+  ///
+  /// If [stream] itself errors, the upload aborts and `execute` fails with
+  /// that error. Composes with [cancelToken]: cancelling fails the request,
+  /// which releases the upload. Requires the FFI platform (the default
+  /// everywhere this plugin ships); the MethodChannel fallback refuses it,
+  /// for the same reason it cannot stream response bodies.
+  VaneRequestBuilder bodyStream(Stream<Uint8List> stream, {int? contentLength}) {
+    _request = VaneRequest(
+      url: _request.url,
+      method: _request.method,
+      headers: _request.headers,
+      queryParams: _request.queryParams,
+      bodyStream: stream,
+      bodyStreamContentLength: contentLength,
       responseBodyPath: _request.responseBodyPath,
       cancelToken: _request.cancelToken,
       onUploadProgress: _request.onUploadProgress,

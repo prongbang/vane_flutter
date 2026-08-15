@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -349,6 +350,41 @@ void main() {
 
     expect(fakePlatform.lastRequest?['bodyFilePath'], '/tmp/input.bin');
     expect(fakePlatform.lastRequest?['body'], isNull);
+
+    VaneFlutterPlatform.instance = initialPlatform;
+  });
+
+  test('bodyStream rides the request map and displaces the other body '
+      'sources', () async {
+    final fakePlatform = MockVaneFlutterPlatform();
+    VaneFlutterPlatform.instance = fakePlatform;
+
+    final client = VaneClient();
+    final source = Stream<Uint8List>.fromIterable(<Uint8List>[
+      Uint8List.fromList(<int>[1, 2]),
+    ]);
+    await client
+        .request('/upload', method: 'POST')
+        .body(Uint8List.fromList(<int>[9]))
+        .bodyStream(source, contentLength: 2)
+        .execute();
+
+    expect(fakePlatform.lastRequest?['bodyStream'], same(source));
+    expect(fakePlatform.lastRequest?['bodyStreamContentLength'], 2);
+    expect(fakePlatform.lastRequest?['body'], isNull);
+    expect(fakePlatform.lastRequest?['bodyFilePath'], isNull);
+
+    // And the reverse: a later buffered body displaces the stream, so a
+    // request can never carry two body sources into the core's refusal.
+    await client
+        .request('/upload', method: 'POST')
+        .bodyStream(source)
+        .body(Uint8List.fromList(<int>[3]))
+        .execute();
+
+    expect(fakePlatform.lastRequest?['bodyStream'], isNull);
+    expect(fakePlatform.lastRequest?['bodyStreamContentLength'], isNull);
+    expect(fakePlatform.lastRequest?['body'], orderedEquals(<int>[3]));
 
     VaneFlutterPlatform.instance = initialPlatform;
   });

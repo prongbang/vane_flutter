@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vane_flutter/vane_flutter_method_channel.dart';
@@ -51,5 +53,22 @@ void main() {
     expect(response.statusCode, 200);
     expect(response.text, 'ok');
     expect(calls.single.method, 'execute');
+  });
+
+  test('a streamed request body is refused before touching the channel',
+      () async {
+    await expectLater(
+      platform.execute(42, <String, Object?>{
+        'url': 'https://example.com',
+        'method': 'POST',
+        'bodyStream': Stream<Uint8List>.fromIterable(<Uint8List>[
+          Uint8List.fromList('x'.codeUnits),
+        ]),
+      }),
+      throwsUnsupportedError,
+    );
+    expect(calls, isEmpty,
+        reason: 'the refusal must not leak an unsendable Stream into the '
+            'codec');
   });
 }

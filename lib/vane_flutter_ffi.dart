@@ -127,6 +127,15 @@ final class _VaneFfiRequest extends Struct {
 
   @Bool()
   external bool followRedirects;
+
+  /// `vane_ffi_body_stream_create` id the request's body streams from; 0 =
+  /// none. Appended in ABI v4 — declaration order IS the offset here, and
+  /// Rust appends it after `follow_redirects` (a u64 cannot ride the seven
+  /// tail-padding bytes, so the struct grew rather than absorbing it).
+  /// Declaring it anywhere but last would desync every field behind it,
+  /// silently.
+  @Uint64()
+  external int bodyStreamId;
 }
 
 final class _VaneFfiBuffer extends Struct {
@@ -279,6 +288,14 @@ typedef _StreamReadNative = _VaneFfiStreamChunk Function(Uint64);
 typedef _StreamReadDart = _VaneFfiStreamChunk Function(int);
 typedef _StreamCloseNative = Void Function(Uint64);
 typedef _StreamCloseDart = void Function(int);
+typedef _BodyStreamCreateNative = Uint64 Function(Int64);
+typedef _BodyStreamCreateDart = int Function(int);
+typedef _BodyStreamWriteNative =
+    Uint32 Function(Uint64, Pointer<Uint8>, Size, Pointer<_VaneFfiBuffer>);
+typedef _BodyStreamWriteDart =
+    int Function(int, Pointer<Uint8>, int, Pointer<_VaneFfiBuffer>);
+typedef _BodyStreamFinishNative = Uint32 Function(Uint64, Pointer<_VaneFfiBuffer>);
+typedef _BodyStreamFinishDart = int Function(int, Pointer<_VaneFfiBuffer>);
 
 /// The C ABI version this package's structs and calls were written against.
 /// Rust exports the native side as `vane_ffi_abi_version`; the two must match
@@ -294,7 +311,14 @@ typedef _StreamCloseDart = void Function(int);
 /// `vane_ffi_stream_read`, `vane_ffi_stream_close` and the
 /// `VaneFfiStreamChunk` struct this package mirrors as
 /// [_VaneFfiStreamChunk].
-const int _expectedAbiVersion = 3;
+///
+/// v4: request-body (upload) streaming — `vane_ffi_body_stream_create`,
+/// `vane_ffi_body_stream_write`, `vane_ffi_body_stream_finish`,
+/// `vane_ffi_body_stream_free`, and `_VaneFfiRequest` gained
+/// `bodyStreamId`. That was a struct GROWTH, not a padding fill: a v3
+/// library reading this package's request struct — or the reverse — would
+/// misread past the end, which is precisely the skew this constant refuses.
+const int _expectedAbiVersion = 4;
 
 /// Verifies the native library speaks this package's C ABI, and returns it.
 ///
@@ -373,6 +397,13 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
 
   @override
   Future<VaneResponse> execute(int handle, Map<String, Object?> request) async {
+    // Extracted before anything else touches the map: a Stream cannot cross
+    // the worker isolate boundary, so the upload rides as a native stream id
+    // while this isolate pumps the caller's source into it.
+    final upload = _startUpload(request);
+    if (upload != null) {
+      request = upload.request;
+    }
     // With DevTools profiling off — the default — this whole feature costs one
     // static bool read and the null checks below. Nothing is allocated and the
     // response body is never touched.
@@ -403,7 +434,7 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
         }
       }
       return response;
-    } catch (error) {
+    } catch (error, stackTrace) {
       if (profile != null) {
         try {
           await profile.responseData.closeWithError(error.toString());
@@ -411,8 +442,63 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
           // Never let a recording failure mask the real error.
         }
       }
+      // The caller's source stream failing is what aborted the upload, and
+      // the abort is what failed the request (as `Cancelled`) — so the
+      // source's own error is the story, not the synthetic one it induced.
+      final sourceError = upload?.driver.sourceError;
+      if (sourceError != null) {
+        Error.throwWithStackTrace(
+          sourceError,
+          upload!.driver.sourceStackTrace ?? stackTrace,
+        );
+      }
       rethrow;
+    } finally {
+      // The exchange is over either way; a still-live driver (server
+      // answered early, or the request failed while the source was idle)
+      // must not keep the source subscribed. Idempotent, and a no-op on the
+      // native side after a clean finish.
+      upload?.driver.dispose();
     }
+  }
+
+  /// Sets up the caller-pushed body stream when [request] carries one:
+  /// creates the native stream, spawns its writer isolate, and starts the
+  /// [UploadStreamDriver] pumping the caller's source into it. Returns the
+  /// map to actually send — the unsendable `Stream` stripped, the native id
+  /// in its place — or null when there is nothing to stream.
+  ({Map<String, Object?> request, UploadStreamDriver driver})? _startUpload(
+    Map<String, Object?> request,
+  ) {
+    final source = request['bodyStream'];
+    if (source == null) {
+      return null;
+    }
+    // Both casts before anything native is allocated: a wrongly-typed map
+    // value must throw here, not leak a registry id.
+    final stream = source as Stream<Uint8List>;
+    final contentLength = request['bodyStreamContentLength'] as int?;
+    final id = _nativeBindings.createBodyStream(contentLength);
+    final writer = _VaneUploadWriter(_resolvedLibrary, id);
+    final driver = UploadStreamDriver(
+      source: stream,
+      onWrite: writer.write,
+      onFinish: writer.finish,
+      onFree: () {
+        // The direct registry call, from this never-parked isolate. The
+        // writer may be parked inside the blocked native write, and this
+        // free is the only thing that releases it — routing it through the
+        // writer's mailbox would queue it behind the very call it must
+        // interrupt.
+        _nativeBindings.freeBodyStream(id);
+        writer.close();
+      },
+    );
+    final stripped = <String, Object?>{...request}
+      ..remove('bodyStream')
+      ..remove('bodyStreamContentLength');
+    stripped['bodyStreamId'] = id;
+    return (request: stripped, driver: driver);
   }
 
   /// One pump isolate per stream, spawned here and owned by the returned
@@ -426,7 +512,14 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
   Future<VaneStreamingResponse> executeStreaming(
     int handle,
     Map<String, Object?> request,
-  ) {
+  ) async {
+    // Same extraction as [execute]. The upload driver and the response pump
+    // are separate isolates making independent blocking calls, so a request
+    // can stream in both directions at once.
+    final upload = _startUpload(request);
+    if (upload != null) {
+      request = upload.request;
+    }
     var tokenId = (request['cancelTokenId'] as int?) ?? 0;
     var ownsToken = false;
     if (tokenId == 0) {
@@ -438,14 +531,34 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
       ownsToken = true;
       request = <String, Object?>{...request, 'cancelTokenId': tokenId};
     }
-    return _VaneStreamPump(
-      _nativeBindings,
-      _resolvedLibrary,
-      handle,
-      request,
-      cancelTokenId: tokenId,
-      ownsCancelToken: ownsToken,
-    ).start();
+    try {
+      return await _VaneStreamPump(
+        _nativeBindings,
+        _resolvedLibrary,
+        handle,
+        request,
+        cancelTokenId: tokenId,
+        ownsCancelToken: ownsToken,
+      ).start();
+    } catch (error, stackTrace) {
+      // The request died at or before the headers, so the upload is over
+      // too. Same source-error precedence as [execute].
+      upload?.driver.dispose();
+      final sourceError = upload?.driver.sourceError;
+      if (sourceError != null) {
+        Error.throwWithStackTrace(
+          sourceError,
+          upload!.driver.sourceStackTrace ?? stackTrace,
+        );
+      }
+      rethrow;
+    }
+    // No dispose on success, deliberately: an HTTP/3 server that answers
+    // early leaves the upload legitimately still pumping after the head
+    // arrives, and the driver tears itself down on its own terminal (clean
+    // finish, a write the core failed, or the source ending). A source that
+    // simply goes silent after the request dies is bounded by the request
+    // timeout: the core's release latch fails the next write.
   }
 
   @override
@@ -1135,6 +1248,361 @@ class _VaneStreamPump {
   }
 }
 
+/// The demand side of a streamed request body — [StreamBodyController]'s
+/// mirror image, with the roles flipped: the app produces, the core
+/// consumes, and the blocking native write is the backpressure.
+///
+/// The whole value of this class is one rule: the caller's source is PAUSED
+/// from the instant a chunk arrives until the core acknowledges its write.
+/// When the transport's send window is full the write parks, the ack never
+/// comes, and the pause holds — so the app's own stream is what stalls, and
+/// Dart-side buffering is bounded at the single chunk in flight. An eager
+/// subscription here would look identical on a demo and buffer unboundedly
+/// against a slow network — `test/vane_flutter_upload_pump_test.dart` is
+/// written to fail if that regresses (it counts what the source produced
+/// against acks, the write-direction twin of the response tests' pull
+/// counts).
+///
+/// The other rule is teardown, where the deadlock risk lives: every terminal
+/// path runs [_stop], which fires [_onFree] — the DIRECT native free from
+/// this never-parked isolate. A writer blocked inside the native write is
+/// released only by that free (or the core's own request-failure latch);
+/// anything routed through the writer isolate's mailbox would queue behind
+/// the very call it must interrupt, and cancel would hang forever.
+///
+/// Error routing, per the design: a write the core fails is NOT re-reported
+/// from here — the execute result carries the same error and is
+/// authoritative; this side just stops. Only a failure of the caller's own
+/// source is recorded ([sourceError]) so the platform can surface it in
+/// place of the synthetic `Cancelled` its abort induces.
+///
+/// Public only for the tests; everything else reaches uploads through
+/// [FfiVaneFlutter]'s request maps.
+@visibleForTesting
+final class UploadStreamDriver {
+  UploadStreamDriver({
+    required Stream<Uint8List> source,
+    required this._onWrite,
+    required this._onFinish,
+    required this._onFree,
+  }) {
+    _subscription = source.listen(
+      _onChunk,
+      onDone: _onSourceDone,
+      onError: _onSourceError,
+      cancelOnError: true,
+    );
+  }
+
+  /// One blocking write on the writer isolate. Never called with one
+  /// outstanding — the pause below is what guarantees it.
+  final Future<void> Function(Uint8List chunk) _onWrite;
+
+  /// One blocking finish on the writer isolate; only ever called with no
+  /// write in flight (the source's done event cannot be delivered while the
+  /// subscription is paused).
+  final Future<void> Function() _onFinish;
+
+  /// Frees the native stream id and retires the writer. Runs on EVERY
+  /// terminal path exactly once: after a clean finish it merely drops the id
+  /// (queued bytes still drain, per the core contract), before one it is the
+  /// abort that fails the request and unparks a blocked writer. Must never
+  /// wait on an in-flight write.
+  final void Function() _onFree;
+
+  late final StreamSubscription<Uint8List> _subscription;
+  final Completer<void> _done = Completer<void>();
+  bool _stopped = false;
+
+  /// The caller's source stream failed; recorded before the abort fires so
+  /// the platform's error path can already see it and report it instead of
+  /// the `Cancelled` the abort induces on the request.
+  Object? sourceError;
+  StackTrace? sourceStackTrace;
+
+  /// Completes — never with an error — once this side reached a terminal
+  /// state: clean finish, stopped on a core-failed write, source
+  /// error/abort, or [dispose].
+  Future<void> get done => _done.future;
+
+  void _onChunk(Uint8List chunk) {
+    // Paused for the whole round trip; this line is the entire backpressure
+    // story on the Dart side.
+    _subscription.pause();
+    _onWrite(chunk).then(
+      (_) {
+        if (!_stopped) {
+          _subscription.resume();
+        }
+      },
+      onError: (Object _) {
+        // The core already failed the request (or the writer died); the
+        // execute result tells that story. Stopping also frees, which is a
+        // harmless second latch on an already-failed stream.
+        _stop();
+      },
+    );
+  }
+
+  void _onSourceDone() {
+    _onFinish().then((_) => _stop(), onError: (Object _) => _stop());
+  }
+
+  void _onSourceError(Object error, StackTrace stackTrace) {
+    sourceError = error;
+    sourceStackTrace = stackTrace;
+    _stop();
+  }
+
+  /// Idempotent single teardown for every path. Synchronous through
+  /// [_onFree] on purpose: dispose-while-parked must reach the native free
+  /// without awaiting anything.
+  void _stop() {
+    if (_stopped) {
+      return;
+    }
+    _stopped = true;
+    _subscription.cancel();
+    _onFree();
+    _done.complete();
+  }
+
+  /// The platform's hook for "the request settled, whatever the source is
+  /// doing": covers a server that answered before the source finished and a
+  /// request that failed while the source sat idle between chunks. Safe (and
+  /// a no-op) at any point after this side's own terminal.
+  void dispose() => _stop();
+}
+
+/// Owns one upload's writer isolate — [_VaneStreamPump]'s mirror: this side
+/// initiates every blocking call, one command in flight at a time (the
+/// driver's pause guarantees it), so the isolate is structurally incapable
+/// of accumulating a chunk backlog. The isolate exits on its own at every
+/// terminal: after 'finished', after reporting a failure (the stream is
+/// latched; nothing more can succeed), or on 'close'.
+class _VaneUploadWriter {
+  _VaneUploadWriter(DynamicLibrary library, int streamId) {
+    _responses.listen(_onMessage);
+    Isolate.spawn(
+      _writerMain,
+      (
+        _responses.sendPort,
+        library.lookup<NativeFunction<_BodyStreamWriteNative>>(
+          'vane_ffi_body_stream_write',
+        ),
+        library.lookup<NativeFunction<_BodyStreamFinishNative>>(
+          'vane_ffi_body_stream_finish',
+        ),
+        library.lookup<NativeFunction<_BufferFreeNative>>(
+          'vane_ffi_buffer_free',
+        ),
+        streamId,
+      ),
+      // Without these a writer that dies leaves the in-flight write's future
+      // pending forever, which would wedge the driver's pause.
+      onExit: _responses.sendPort,
+      onError: _responses.sendPort,
+    ).then((_) {}, onError: _onSpawnError);
+    // No Isolate handle is kept, same as the response pump: the writer exits
+    // by protocol, and a blocked write is interrupted through the native
+    // free, never by killing an isolate mid-FFI-call.
+  }
+
+  final ReceivePort _responses = ReceivePort();
+  final Completer<SendPort> _commands = Completer<SendPort>();
+
+  /// The single in-flight call's completer; the driver's discipline is what
+  /// makes a single slot sufficient.
+  Completer<void>? _pending;
+  SendPort? _commandPort;
+  bool _closeRequested = false;
+  bool _dead = false;
+
+  Future<void> write(Uint8List chunk) =>
+      _send(('write', TransferableTypedData.fromList(<Uint8List>[chunk])));
+
+  Future<void> finish() => _send('finish');
+
+  /// Fire-and-forget retirement. Dropped silently if the writer already
+  /// exited; queues harmlessly behind a parked write otherwise (the free
+  /// that accompanies it is what releases that write). A close that lands
+  /// before the isolate reported its port — a source that errors in its
+  /// first microtask gets here — is deferred to the port's arrival, or the
+  /// isolate would idle forever.
+  void close() {
+    _closeRequested = true;
+    _commandPort?.send('close');
+  }
+
+  Future<void> _send(Object command) async {
+    if (_dead) {
+      throw const VaneHttpException('Vane upload writer isolate is gone.');
+    }
+    final commands = await _commands.future;
+    final completer = Completer<void>();
+    assert(_pending == null, 'upload writer called with a call outstanding');
+    _pending = completer;
+    commands.send(command);
+    return completer.future;
+  }
+
+  void _onSpawnError(Object error, StackTrace stackTrace) {
+    _die(
+      VaneHttpException('Vane upload writer isolate failed to spawn: $error'),
+      stackTrace,
+    );
+  }
+
+  void _onMessage(Object? message) {
+    if (message is SendPort) {
+      _commandPort = message;
+      if (_closeRequested) {
+        // The driver tore down before the writer was even ready. A _send
+        // racing this close loses harmlessly: its command lands on the
+        // closed port and its completer goes unanswered, which is fine
+        // because close() is only ever called from the driver's terminal
+        // state — nothing behind that completer can act again.
+        message.send('close');
+      }
+      _commands.complete(message);
+      return;
+    }
+    if (message == null || message is List) {
+      // onExit sends null, onError sends [error, stackTrace]. After a clean
+      // 'finished'/'failed'/'close' exit there is no pending call and this
+      // is routine cleanup; mid-write it is the only thing standing between
+      // the driver and a pause that never lifts.
+      _die(
+        VaneHttpException(
+          message is List
+              ? 'Vane upload writer isolate died: ${message.first}'
+              : 'Vane upload writer isolate exited.',
+        ),
+        message is List && message.length > 1
+            ? StackTrace.fromString('${message[1]}')
+            : null,
+      );
+      return;
+    }
+    final pending = _pending;
+    _pending = null;
+    switch (message) {
+      case 'written' || 'finished':
+        pending?.complete();
+      case ('failed', final String text, final int kind):
+        pending?.completeError(VaneHttpException(text, kind: _errorKind(kind)));
+      default:
+        assert(false, 'unknown Vane upload writer message: $message');
+    }
+  }
+
+  void _die(Object error, [StackTrace? stackTrace]) {
+    if (_dead) {
+      return;
+    }
+    _dead = true;
+    _responses.close();
+    final pending = _pending;
+    _pending = null;
+    if (!_commands.isCompleted) {
+      _commands.completeError(error, stackTrace);
+      // A _send parked on the completer above consumes the error; without a
+      // waiter, mark it handled so a failed spawn after teardown cannot
+      // surface as an unhandled asynchronous error.
+      _commands.future.ignore();
+    }
+    pending?.completeError(error, stackTrace);
+  }
+
+  /// Runs on the writer isolate: one blocking native call per command, one
+  /// reply per call — deliberately incapable of running ahead, exactly like
+  /// the response pump's read side. Exits at every terminal so the parent's
+  /// onExit doubles as the cleanup signal.
+  static void _writerMain(
+    (
+      SendPort,
+      Pointer<NativeFunction<_BodyStreamWriteNative>>,
+      Pointer<NativeFunction<_BodyStreamFinishNative>>,
+      Pointer<NativeFunction<_BufferFreeNative>>,
+      int,
+    )
+    init,
+  ) {
+    final (responses, writePointer, finishPointer, freePointer, streamId) =
+        init;
+    final write = writePointer.asFunction<_BodyStreamWriteDart>();
+    final finish = finishPointer.asFunction<_BodyStreamFinishDart>();
+    final bufferFree = freePointer.asFunction<_BufferFreeDart>();
+    final commands = ReceivePort();
+    responses.send(commands.sendPort);
+    final outError = calloc<_VaneFfiBuffer>();
+
+    /// Reads and frees the error buffer; empty means success, by the ABI
+    /// contract (the buffer, not the kind, is the discriminator).
+    String? takeError() {
+      final error = outError.ref;
+      if (error.data == nullptr || error.len == 0) {
+        return null;
+      }
+      final text = utf8.decode(error.data.asTypedList(error.len));
+      bufferFree(outError.ref);
+      return text;
+    }
+
+    void exitNow() {
+      calloc.free(outError);
+      commands.close();
+    }
+
+    commands.listen((Object? command) {
+      // Everything inside the try: an escaping error would kill the isolate
+      // while the parent believes a call is in flight.
+      try {
+        switch (command) {
+          case 'close':
+            exitNow();
+          case 'finish':
+            final kind = finish(streamId, outError);
+            final failure = takeError();
+            responses.send(
+              failure == null ? 'finished' : ('failed', failure, kind),
+            );
+            exitNow();
+          case ('write', final TransferableTypedData data):
+            final chunk = _NativeBytes(data.materialize().asUint8List());
+            try {
+              final kind = write(
+                streamId,
+                chunk.pointer,
+                chunk.length,
+                outError,
+              );
+              final failure = takeError();
+              if (failure == null) {
+                responses.send('written');
+              } else {
+                // Terminal: the stream (and its request) is latched; no
+                // later call can succeed, so exit rather than linger.
+                responses.send(('failed', failure, kind));
+                exitNow();
+              }
+            } finally {
+              chunk.free();
+            }
+          default:
+            assert(false, 'unknown Vane upload writer command: $command');
+        }
+      } catch (caught) {
+        // Strings only, like the worker and the pump: an unsendable error
+        // object thrown while reporting a failure would kill the writer
+        // silently.
+        responses.send(('failed', caught.toString(), 0));
+        exitNow();
+      }
+    });
+  }
+}
+
 class _VaneFfiBindings {
   _VaneFfiBindings(DynamicLibrary library)
     : _clientCreate = library
@@ -1192,6 +1660,19 @@ class _VaneFfiBindings {
       _progressFree = library.lookupFunction<_IdActionNative, _IdActionDart>(
         'vane_ffi_progress_free',
         isLeaf: true,
+      ),
+      // Same id-table dialect as the token and progress trios. Only create
+      // and free are bound here: write and finish BLOCK (that blocking is
+      // the upload backpressure), so they run on the writer isolate from raw
+      // symbol pointers, never on this isolate.
+      _bodyStreamCreate = library
+          .lookupFunction<_BodyStreamCreateNative, _BodyStreamCreateDart>(
+            'vane_ffi_body_stream_create',
+            isLeaf: true,
+          ),
+      _bodyStreamFree = library.lookupFunction<_IdActionNative, _IdActionDart>(
+        'vane_ffi_body_stream_free',
+        isLeaf: true,
       );
 
   final _ClientCreateDart _clientCreate;
@@ -1206,6 +1687,8 @@ class _VaneFfiBindings {
   final _IdCreateDart _progressCreate;
   final _ProgressSnapshotDart _progressSnapshot;
   final _IdActionDart _progressFree;
+  final _BodyStreamCreateDart _bodyStreamCreate;
+  final _IdActionDart _bodyStreamFree;
 
   int createClient(Map<String, Object?> configuration) {
     final config = _NativeConfig(configuration);
@@ -1323,6 +1806,16 @@ class _VaneFfiBindings {
   void freeCancelToken(int id) => _cancelTokenFree(id);
 
   int createProgress() => _progressCreate();
+
+  /// Negative-means-none is the ABI dialect for the optional length, same as
+  /// `timeout_seconds`.
+  int createBodyStream(int? contentLength) => _bodyStreamCreate(contentLength ?? -1);
+
+  /// Releases the id; before a clean finish this aborts the request AND
+  /// unparks a writer blocked inside the native write — which is why it must
+  /// always be called from this (never-parked) isolate, not sent through the
+  /// writer isolate's mailbox.
+  void freeBodyStream(int id) => _bodyStreamFree(id);
 
   VaneProgress progressSnapshot(int id) {
     final progress = _progressSnapshot(id);
@@ -1596,6 +2089,7 @@ class _NativeRequest {
     ref.progressId = request['progressId'] as int? ?? 0;
     ref.timeoutSeconds = request['timeoutSeconds'] as int? ?? -1;
     ref.followRedirects = request['followRedirects'] as bool? ?? true;
+    ref.bodyStreamId = request['bodyStreamId'] as int? ?? 0;
   }
 
   final Pointer<_VaneFfiRequest> pointer;

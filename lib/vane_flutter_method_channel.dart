@@ -8,7 +8,10 @@ import 'vane_flutter_platform_interface.dart';
 /// of exposing the C ABI. Buffered requests only: `executeStreaming` is
 /// deliberately not implemented here — a demand-driven body cannot ride a
 /// request/response channel (see `VaneFlutterPlatform.executeStreaming`) —
-/// so it throws [UnimplementedError] from the base class.
+/// so it throws [UnimplementedError] from the base class. Streamed request
+/// bodies are refused for the mirrored reason: their backpressure is one
+/// blocking native write per source chunk, which a request/response channel
+/// cannot express without an ack-per-chunk protocol.
 class MethodChannelVaneFlutter extends VaneFlutterPlatform {
   @visibleForTesting
   final methodChannel = const MethodChannel('vane_flutter');
@@ -27,6 +30,16 @@ class MethodChannelVaneFlutter extends VaneFlutterPlatform {
 
   @override
   Future<VaneResponse> execute(int handle, Map<String, Object?> request) async {
+    if (request['bodyStream'] != null) {
+      // Refused loudly rather than left to the codec's unsendable-object
+      // error: the message names the real constraint, mirroring the
+      // executeStreaming stance above.
+      throw UnsupportedError(
+        'Streamed request bodies are not supported on the MethodChannel '
+        'fallback platform; buffer the body, or use a platform served by '
+        'the FFI implementation.',
+      );
+    }
     final response = await methodChannel.invokeMethod<Map<Object?, Object?>>(
       'execute',
       <String, Object?>{'handle': handle, 'request': request},
