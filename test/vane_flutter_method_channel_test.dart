@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:vane_flutter/vane_flutter.dart';
 import 'package:vane_flutter/vane_flutter_method_channel.dart';
 
 void main() {
@@ -19,12 +20,22 @@ void main() {
             case 'createClient':
               return 42;
             case 'execute':
+              // The exact shape both native plugins' toMap() serializes:
+              // ordered [name, value] pairs, duplicates preserved, set-cookie
+              // inline, plus remoteIp. The parser and the plugins move
+              // together — this fixture is the Dart end of that contract.
               return <String, Object?>{
                 'statusCode': 200,
-                'headers': <String, String>{'content-type': 'text/plain'},
+                'headers': <Object?>[
+                  <Object?>['set-cookie', 'a=1'],
+                  <Object?>['content-type', 'text/plain'],
+                  <Object?>['set-cookie', 'b=2'],
+                ],
                 'body': Uint8List.fromList('ok'.codeUnits),
                 'isSuccess': true,
                 'url': 'https://example.com',
+                'httpVersion': 'http3',
+                'remoteIp': '203.0.113.7',
               };
             case 'closeClient':
               return null;
@@ -52,6 +63,18 @@ void main() {
 
     expect(response.statusCode, 200);
     expect(response.text, 'ok');
+    // The plugin-shaped map parses into the same model the FFI path
+    // produces: the ordered pair list with both duplicates, the derived
+    // views over it, and remoteIp.
+    expect(response.headers, <(String, String)>[
+      ('set-cookie', 'a=1'),
+      ('content-type', 'text/plain'),
+      ('set-cookie', 'b=2'),
+    ]);
+    expect(response.headerMap['content-type'], 'text/plain');
+    expect(response.setCookie, <String>['a=1', 'b=2']);
+    expect(response.httpVersion, VaneHttpVersion.http3);
+    expect(response.remoteIp, '203.0.113.7');
     expect(calls.single.method, 'execute');
   });
 

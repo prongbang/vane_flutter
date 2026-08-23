@@ -161,17 +161,19 @@ class VaneFlutterPlugin : FlutterPlugin, MethodCallHandler {
     private fun com.inteniquetic.vanekotlin.VaneResponse.toMap(): Map<String, Any?> {
         return mapOf(
             "statusCode" to statusCode.toInt(),
-            "headers" to headers,
+            // Ordered [name, value] pairs, duplicates preserved, set-cookie
+            // inline in arrival position — the same shape the FFI path reads.
+            // The Dart parser and both plugins move together, or this path
+            // silently mis-parses.
+            "headers" to headers.map { listOf(it.name, it.value) },
             "body" to body,
             "bodyFilePath" to bodyFilePath,
             "isSuccess" to isSuccess,
             "url" to url,
+            "httpVersion" to httpVersion?.name?.lowercase(),
             // Kept at parity with the FFI path: a field present on one Flutter
             // transport and absent on the other only reproduces on some setups.
-            // Raw and unfiltered — a cookie Vane's own jar refused (a
-            // public-suffix Domain, or an IP literal) still appears here.
-            "setCookie" to setCookie,
-            "httpVersion" to httpVersion?.name?.lowercase()
+            "remoteIp" to remoteIp
         )
     }
 

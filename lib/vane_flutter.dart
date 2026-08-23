@@ -273,28 +273,64 @@ class VaneResponse {
     this.bodyFilePath,
     required this.isSuccess,
     required this.url,
-    this.setCookie = const <String>[],
     this.httpVersion,
+    this.remoteIp,
   });
 
   final int statusCode;
-  final Map<String, String> headers;
+
+  /// Ordered `(name, value)` pairs: names lowercased, duplicates preserved,
+  /// `set-cookie` inline in arrival position. On HTTP/3 this is wire order;
+  /// on TCP it is reqwest `HeaderMap` order (duplicates of a name grouped).
+  /// [headerMap] and [headerMapList] are the derived map views; [setCookie]
+  /// is the filtered cookie view.
+  final List<(String, String)> headers;
+
   final Uint8List body;
   final String? bodyFilePath;
   final bool isSuccess;
   final String url;
 
-  /// Raw `Set-Cookie` values from the final response, in wire order.
-  ///
-  /// Unfiltered: a cookie Vane's own jar refused still appears here, because
-  /// this reports what the server sent. Never present in [headers] — a
-  /// `Map<String, String>` cannot hold repeats and `Set-Cookie` values contain
-  /// commas, so they cannot be joined losslessly.
-  final List<String> setCookie;
-
   /// Protocol that served the final response, or `null` when no exchange
   /// completed or the transport could not say.
   final VaneHttpVersion? httpVersion;
+
+  /// IP literal of the socket peer of the connection that produced the final
+  /// response — `"203.0.113.7"`, `"2001:db8::1"`: no port, no brackets.
+  /// Through a MASQUE or CONNECT proxy this is the proxy, the actual socket
+  /// peer. `null` when the transport could not say.
+  final String? remoteIp;
+
+  /// Single-valued view of [headers]: the FIRST occurrence of a repeated
+  /// name wins — the same rule the core's redirect gate applies to
+  /// `location`. Use [headers] or [headerMapList] to see every repeat.
+  Map<String, String> get headerMap {
+    final map = <String, String>{};
+    for (final (name, value) in headers) {
+      map.putIfAbsent(name, () => value);
+    }
+    return map;
+  }
+
+  /// Multi-valued view of [headers]: every occurrence of every name, in
+  /// arrival order. Built fresh on each read, growable, so a caller may
+  /// mutate the result without touching this response.
+  Map<String, List<String>> get headerMapList {
+    final map = <String, List<String>>{};
+    for (final (name, value) in headers) {
+      (map[name] ??= <String>[]).add(value);
+    }
+    return map;
+  }
+
+  /// Raw `Set-Cookie` values from the final response, in wire order.
+  ///
+  /// Unfiltered: a cookie Vane's own jar refused still appears here, because
+  /// this reports what the server sent.
+  List<String> get setCookie => <String>[
+    for (final (name, value) in headers)
+      if (name == 'set-cookie') value,
+  ];
 
   String get text => utf8.decode(body, allowMalformed: true);
 
@@ -312,26 +348,25 @@ class VaneResponse {
   }
 
   static VaneResponse fromMap(Map<Object?, Object?> map) {
-    final rawHeaders = (map['headers'] as Map<Object?, Object?>?) ?? const {};
+    final rawHeaders = (map['headers'] as List<Object?>?) ?? const <Object?>[];
     return VaneResponse(
       statusCode: (map['statusCode'] as num).toInt(),
-      headers: rawHeaders.map(
-        (key, value) => MapEntry(key.toString(), value.toString()),
-      ),
+      // Each entry is a two-element `[name, value]` list — the one shape both
+      // MethodChannel plugins emit; the plugins and this parser move
+      // together, or this path silently mis-parses.
+      headers: <(String, String)>[
+        for (final entry in rawHeaders)
+          if (entry is List<Object?> && entry.length == 2)
+            (entry[0].toString(), entry[1].toString()),
+      ],
       body: Uint8List.fromList((map['body'] as Uint8List?) ?? Uint8List(0)),
       bodyFilePath: map['bodyFilePath'] as String?,
       isSuccess: map['isSuccess'] as bool? ?? false,
       url: map['url'] as String? ?? '',
-      // Read defensively: an older plugin sends neither key, and the defaults
-      // are exactly what it used to mean.
-      setCookie:
-          (map['setCookie'] as List<Object?>?)
-              ?.map((value) => value.toString())
-              .toList(growable: false) ??
-          const <String>[],
       httpVersion: VaneHttpVersion.values
           .where((version) => version.name == map['httpVersion'])
           .firstOrNull,
+      remoteIp: map['remoteIp'] as String?,
     );
   }
 }

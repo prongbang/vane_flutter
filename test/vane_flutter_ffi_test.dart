@@ -623,7 +623,7 @@ void main() {
           });
 
           expect(response.body, isNotEmpty);
-          final contentLength = response.headers['content-length'];
+          final contentLength = response.headerMap['content-length'];
           if (contentLength != null) {
             expect(response.body.length, int.parse(contentLength));
           }
@@ -652,10 +652,11 @@ void main() {
       );
 
       // The only thing that catches a struct-layout desync between Rust's
-      // VaneFfiResponse and the Dart mirror: both new fields are decoded from
-      // the real native response, not from a fake.
+      // VaneFfiResponse and the Dart mirror: the header array and the
+      // v5-appended remoteIp buffer are decoded from the real native
+      // response, not from a fake.
       test(
-        'set-cookie and the negotiated protocol survive the real ABI',
+        'duplicate set-cookie arrives as ordered pairs and remoteIp is set',
         skip: _liveBaseUrl() == null
             ? 'set VANE_TEST_BASE_URL to an https:// HTTP/3 host'
             : null,
@@ -665,16 +666,29 @@ void main() {
             'timeoutSeconds': 20,
           });
           final response = await platform.execute(live, <String, Object?>{
-            'url': '/cookies/set/vane_cookie/1',
+            // Two cookies, so set-cookie genuinely repeats.
+            'url': '/cookies/set?vane_a=1&vane_b=2',
             'method': 'GET',
             'followRedirects': false,
           });
 
-          expect(response.setCookie, isNotEmpty);
-          expect(response.setCookie.first, contains('vane_cookie'));
-          // Never in the map, or repeats would collapse silently.
-          expect(response.headers, isNot(contains('set-cookie')));
+          // The header list keeps both occurrences, inline and in arrival
+          // order — the ABI v5 positional-order contract.
+          final cookies = response.setCookie;
+          expect(cookies, hasLength(2));
+          expect(cookies.first, contains('vane_a'));
+          expect(cookies.last, contains('vane_b'));
+          expect(
+            response.headers.where((pair) => pair.$1 == 'set-cookie'),
+            hasLength(2),
+          );
           expect(response.httpVersion, VaneHttpVersion.http3);
+
+          // remoteIp rides the buffer appended in ABI v5: non-null, and an
+          // actual IP literal — no port, no brackets.
+          final remoteIp = response.remoteIp;
+          expect(remoteIp, isNotNull);
+          expect(InternetAddress.tryParse(remoteIp!), isNotNull);
 
           await platform.closeClient(live);
         },

@@ -28,7 +28,7 @@ class MockVaneFlutterPlatform
     lastRequest = request;
     return VaneResponse(
       statusCode: 200,
-      headers: const <String, String>{'content-type': 'text/plain'},
+      headers: const <(String, String)>[('content-type', 'text/plain')],
       body: Uint8List.fromList('ok'.codeUnits),
       isSuccess: true,
       url: request['url'] as String,
@@ -46,7 +46,7 @@ class MockVaneFlutterPlatform
     return VaneStreamingResponse(
       head: VaneResponse(
         statusCode: 200,
-        headers: const <String, String>{'content-type': 'text/plain'},
+        headers: const <(String, String)>[('content-type', 'text/plain')],
         body: Uint8List(0),
         isSuccess: true,
         url: request['url'] as String,
@@ -266,7 +266,10 @@ void main() {
         ..addResponseInterceptor(
           (response) => VaneResponse(
             statusCode: response.statusCode,
-            headers: <String, String>{...response.headers, 'x-response': '1'},
+            headers: <(String, String)>[
+              ...response.headers,
+              ('x-response', '1'),
+            ],
             body: response.body,
             bodyFilePath: response.bodyFilePath,
             isSuccess: response.isSuccess,
@@ -279,7 +282,7 @@ void main() {
       expect(fakePlatform.lastRequest?['headers'], <String, String>{
         'x-late': '1',
       });
-      expect(response.headers['x-response'], '1');
+      expect(response.headerMap['x-response'], '1');
 
       client.clearInterceptors();
       await client.get('/clear');
@@ -526,28 +529,88 @@ void main() {
     },
   );
 
-  test('VaneResponse.fromMap reads the new keys and defaults without them', () {
+  test('VaneResponse.fromMap reads the plugin-shaped pair list and remoteIp',
+      () {
+    // The exact shape both MethodChannel plugins serialize: headers as
+    // [name, value] lists in arrival order, duplicates preserved, set-cookie
+    // inline; the codec delivers them as List<Object?>.
     final full = VaneResponse.fromMap(<Object?, Object?>{
       'statusCode': 200,
-      'headers': <Object?, Object?>{},
+      'headers': <Object?>[
+        <Object?>['set-cookie', 'a=1'],
+        <Object?>['content-type', 'text/plain'],
+        <Object?>['set-cookie', 'b=2'],
+      ],
       'isSuccess': true,
       'url': 'https://example.com/',
-      'setCookie': <Object?>['a=1', 'b=2'],
       'httpVersion': 'http2',
+      'remoteIp': '203.0.113.7',
     });
+    expect(full.headers, <(String, String)>[
+      ('set-cookie', 'a=1'),
+      ('content-type', 'text/plain'),
+      ('set-cookie', 'b=2'),
+    ]);
     expect(full.setCookie, <String>['a=1', 'b=2']);
     expect(full.httpVersion, VaneHttpVersion.http2);
+    expect(full.remoteIp, '203.0.113.7');
 
-    // An older plugin sends neither key, and an unknown spelling is not a
-    // crash.
+    // Optional keys absent, and an unknown protocol spelling is not a crash.
     final bare = VaneResponse.fromMap(<Object?, Object?>{
       'statusCode': 200,
-      'headers': <Object?, Object?>{},
+      'headers': <Object?>[],
       'isSuccess': true,
       'url': 'https://example.com/',
       'httpVersion': 'http9',
     });
+    expect(bare.headers, isEmpty);
     expect(bare.setCookie, isEmpty);
     expect(bare.httpVersion, isNull);
+    expect(bare.remoteIp, isNull);
+  });
+
+  test('headerMap is first-wins and headerMapList keeps every duplicate', () {
+    final response = VaneResponse(
+      statusCode: 200,
+      headers: const <(String, String)>[
+        ('x-multi', 'first'),
+        ('content-type', 'text/plain'),
+        ('x-multi', 'second'),
+        ('set-cookie', 'a=1'),
+      ],
+      body: Uint8List(0),
+      isSuccess: true,
+      url: 'https://example.com/',
+    );
+
+    // First occurrence wins — the same rule the core's redirect gate applies
+    // to `location`.
+    expect(response.headerMap['x-multi'], 'first');
+    expect(response.headerMap['content-type'], 'text/plain');
+
+    // The multimap keeps BOTH values, in arrival order — this view is what
+    // guards the dio adapter against silently dropping repeats.
+    expect(response.headerMapList['x-multi'], <String>['first', 'second']);
+    expect(response.headerMapList['set-cookie'], <String>['a=1']);
+
+    // Derived views are fresh per read: mutating one never reaches back.
+    response.headerMapList['x-multi']!.add('third');
+    expect(response.headerMapList['x-multi'], <String>['first', 'second']);
+  });
+
+  test('setCookie is the filtered in-order view of the header list', () {
+    final response = VaneResponse(
+      statusCode: 200,
+      headers: const <(String, String)>[
+        ('set-cookie', 'a=1; Path=/'),
+        ('content-type', 'text/plain'),
+        ('set-cookie', 'b=2; Path=/'),
+      ],
+      body: Uint8List(0),
+      isSuccess: true,
+      url: 'https://example.com/',
+    );
+
+    expect(response.setCookie, <String>['a=1; Path=/', 'b=2; Path=/']);
   });
 }

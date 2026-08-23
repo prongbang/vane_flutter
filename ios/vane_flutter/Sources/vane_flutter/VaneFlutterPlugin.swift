@@ -274,17 +274,19 @@ private extension VaneResponse {
   func toMap() -> [String: Any] {
     return [
       "statusCode": Int(statusCode),
-      "headers": headers,
+      // Ordered [name, value] pairs, duplicates preserved, set-cookie inline
+      // in arrival position — the same shape the FFI path reads. The Dart
+      // parser and both plugins move together, or this path silently
+      // mis-parses.
+      "headers": headers.map { [$0.name, $0.value] },
       "body": FlutterStandardTypedData(bytes: body),
       "bodyFilePath": bodyFilePath as Any,
       "isSuccess": isSuccess,
       "url": url,
+      "httpVersion": httpVersion.map { "\($0)" } as Any,
       // Kept at parity with the FFI path: a field present on one Flutter
       // transport and absent on the other only reproduces on some setups.
-      // Raw and unfiltered — a cookie Vane's own jar refused (a public-suffix
-      // Domain, or an IP literal) still appears here.
-      "setCookie": setCookie,
-      "httpVersion": httpVersion.map { "\($0)" } as Any
+      "remoteIp": remoteIp as Any
     ]
   }
 }

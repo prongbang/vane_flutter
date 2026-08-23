@@ -21,16 +21,13 @@ import 'vane_flutter.dart';
 /// Known ceilings, all inherited from the core rather than introduced here:
 /// - The core returns a complete response body, so [send] yields it as a single
 ///   chunk. Real chunked streaming needs an incremental read on the Rust side.
-/// - Response headers are single-valued: the core comma-joins repeated ones
-///   into one `', '`-separated value (identically on both transports), which
-///   [http.BaseResponse.headersSplitValues] splits back apart. `set-cookie` is
-///   the exception and is handled below.
-/// - `set-cookie` is comma-joined into [http.BaseResponse.headers], which is
-///   what `package:http`'s own `IOClient` does — multiple cookies are ambiguous
-///   there by `package:http`'s design, not Vane's. Splitting the joined value
-///   on `,` is wrong: an `Expires` attribute contains one. Use
-///   [http.BaseResponse.headersSplitValues], whose `set-cookie` splitter
-///   accounts for that, or [VaneResponse.setCookie] for the lossless list.
+/// - [http.BaseResponse.headers] is `Map<String, String>`, so a repeated
+///   header name — `set-cookie` included — is comma-joined into one value,
+///   the same lossy join `package:http`'s own `IOClient` does.
+///   [http.BaseResponse.headersSplitValues] splits it back apart (its
+///   `set-cookie` splitter accounts for the comma inside an `Expires`
+///   attribute — a naive `split(',')` is wrong there); [VaneResponse.headers]
+///   is the lossless ordered list.
 /// - Those `set-cookie` values are raw and unfiltered — a cookie Vane's own
 ///   jar refused (a `Domain` that is a public suffix, or an IP literal) still
 ///   appears among them. Feeding them straight into a third-party cookie store
@@ -139,15 +136,13 @@ class VaneHttpClient extends http.BaseClient {
         response.statusCode,
         contentLength: response.body.length,
         request: request,
-        headers: response.setCookie.isEmpty
-            ? response.headers
-            // A new map: the FFI one may be const. Comma-joined because
-            // BaseResponse.headers is Map<String, String> — the same lossy
-            // thing package:http's own IOClient does.
-            : <String, String>{
-                ...response.headers,
-                'set-cookie': response.setCookie.join(','),
-              },
+        // Comma-joined because BaseResponse.headers is Map<String, String> —
+        // the same lossy join package:http's own IOClient does;
+        // headersSplitValues recovers the repeats.
+        headers: <String, String>{
+          for (final entry in response.headerMapList.entries)
+            entry.key: entry.value.join(','),
+        },
       );
     } finally {
       await token?.dispose();

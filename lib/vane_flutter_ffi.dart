@@ -217,9 +217,7 @@ final class _VaneFfiResponse extends Struct {
 
   /// IP literal of the socket peer ("203.0.113.7"); empty = unknown. Appended
   /// in ABI v5 — the padding after [isSuccess] was spent in v3, so this GROWS
-  /// the struct. Always empty until batch 2 of the v5 rollout fills it (and
-  /// the response model starts reading it); declared now because the layout
-  /// is the v5 contract. Freed with the rest of the response by
+  /// the struct. Freed with the rest of the response by
   /// `vane_ffi_response_free`.
   external _VaneFfiBuffer remoteIp;
 }
@@ -1792,9 +1790,10 @@ class _VaneFfiBindings {
       if (error.isNotEmpty) {
         throw VaneHttpException(error, kind: _errorKind(response.errorKind));
       }
-      final (headers, setCookie) = _readHeaders(response.headers);
+      final headers = _readHeaders(response.headers);
       final bodyFilePath = _readString(response.bodyFilePath);
       final url = _readString(response.url);
+      final remoteIp = _readString(response.remoteIp);
       final buffer = response.body;
       final Uint8List body;
       if (buffer.data == nullptr || buffer.len == 0) {
@@ -1817,8 +1816,8 @@ class _VaneFfiBindings {
         bodyFilePath: bodyFilePath,
         isSuccess: response.isSuccess,
         url: url,
-        setCookie: setCookie,
         httpVersion: _httpVersion(response.httpVersion),
+        remoteIp: remoteIp.isEmpty ? null : remoteIp,
       );
     } finally {
       if (owned) {
@@ -1952,20 +1951,10 @@ Future<void> _finishProfile(
       ..startTime = responseTime
       ..statusCode = response.statusCode
       ..contentLength = response.body.length;
-    if (response.setCookie.isEmpty) {
-      profile.responseData.headersCommaValues = response.headers;
-    } else {
-      // `response.headers` can never hold `set-cookie` (the core keeps it out
-      // and `_readHeaders` routes it out), so the comma-values map would show
-      // a login response with no Set-Cookie at all — the exact symptom the
-      // field exists to remove. The list-valued map is the only one that can
-      // carry repeats.
-      profile.responseData.headersListValues = <String, List<String>>{
-        for (final header in response.headers.entries)
-          header.key: <String>[header.value],
-        'set-cookie': response.setCookie,
-      };
-    }
+    // The list-valued map is the only one that can carry repeats — dropping
+    // them would show a login response with no Set-Cookie at all, the exact
+    // symptom the ordered header list exists to remove.
+    profile.responseData.headersListValues = response.headerMapList;
     if (response.body.length <= _maxProfiledBodyBytes) {
       // The sink copies the bytes, which is the price of profiling; the
       // response itself keeps its zero-copy view.
@@ -2005,29 +1994,17 @@ String _profileUri(Map<String, Object?> request, String? baseUrl) {
   }
 }
 
-/// Splits the native header array into the single-valued map and the raw
-/// `Set-Cookie` list.
-///
-/// The array is a list, not a map: the core appends one `("set-cookie", value)`
-/// entry per cookie, so `set-cookie` is the one key that legitimately repeats.
-/// Routing it out is mandatory — left in, N cookies collapse to one arbitrary
-/// value with nothing to notice it by.
-(Map<String, String>, List<String>) _readHeaders(_VaneFfiHeaderArray headers) {
+/// Reads the native header array verbatim: ordered `(name, value)` pairs,
+/// duplicates preserved, `set-cookie` inline in arrival position — the ABI v5
+/// positional-order contract. The derived map views live on [VaneResponse].
+List<(String, String)> _readHeaders(_VaneFfiHeaderArray headers) {
   if (headers.data == nullptr || headers.len == 0) {
-    return (const <String, String>{}, const <String>[]);
+    return const <(String, String)>[];
   }
-  final map = <String, String>{};
-  final setCookie = <String>[];
-  for (var index = 0; index < headers.len; index += 1) {
+  return List<(String, String)>.generate(headers.len, (index) {
     final header = (headers.data + index).ref;
-    final key = _readString(header.key);
-    if (key == 'set-cookie') {
-      setCookie.add(_readString(header.value));
-    } else {
-      map[key] = _readString(header.value);
-    }
-  }
-  return (map, setCookie);
+    return (_readString(header.key), _readString(header.value));
+  }, growable: false);
 }
 
 /// Ordinals are the ABI contract with `VaneHttpVersion::ffi_code`, which starts

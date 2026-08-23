@@ -21,10 +21,11 @@ class _RecordingPlatform
   Completer<void>? gate;
   VaneResponse response = VaneResponse(
     statusCode: 201,
-    headers: const <String, String>{
-      'content-type': 'text/plain',
-      'x-multi': 'a, b',
-    },
+    headers: const <(String, String)>[
+      ('content-type', 'text/plain'),
+      ('x-multi', 'a'),
+      ('x-multi', 'b'),
+    ],
     body: Uint8List.fromList(utf8.encode('hello')),
     isSuccess: true,
     url: 'https://example.com/thing',
@@ -123,7 +124,10 @@ void main() {
     expect(response.statusCode, 201);
     expect(response.body, 'hello');
     expect(response.headers['content-type'], 'text/plain');
-    expect(response.headers['x-multi'], 'a, b');
+    // The repeated name is comma-joined into the single-valued map — the
+    // same lossy join IOClient does — and split back apart losslessly.
+    expect(response.headers['x-multi'], 'a,b');
+    expect(response.headersSplitValues['x-multi'], <String>['a', 'b']);
     expect(response.contentLength, 5);
     // No set-cookie on this response, so no phantom key either.
     expect(response.headers, isNot(contains('set-cookie')));
@@ -132,16 +136,16 @@ void main() {
   test('set-cookie is comma-joined into the headers map', () async {
     fake.response = VaneResponse(
       statusCode: 200,
-      headers: const <String, String>{'content-type': 'text/plain'},
+      // The first cookie carries an `Expires`, whose comma is what makes the
+      // joined string unsplittable by a naive `split(',')`.
+      headers: const <(String, String)>[
+        ('content-type', 'text/plain'),
+        ('set-cookie', 'a=1; Expires=Wed, 09 Jun 2021 10:18:14 GMT'),
+        ('set-cookie', 'b=2; Path=/'),
+      ],
       body: Uint8List(0),
       isSuccess: true,
       url: 'https://example.com/thing',
-      // The first value carries an `Expires`, whose comma is what makes the
-      // joined string unsplittable by a naive `split(',')`.
-      setCookie: const <String>[
-        'a=1; Expires=Wed, 09 Jun 2021 10:18:14 GMT',
-        'b=2; Path=/',
-      ],
     );
     final client = VaneHttpClient(client: vane);
 
@@ -253,7 +257,7 @@ void main() {
   test('an unparsable status becomes a ClientException', () async {
     fake.response = VaneResponse(
       statusCode: 0,
-      headers: const <String, String>{},
+      headers: const <(String, String)>[],
       body: Uint8List(0),
       isSuccess: false,
       url: 'https://example.com/thing',
