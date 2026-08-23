@@ -846,6 +846,100 @@ void main() {
       );
 
       test(
+        'a live streamed upload never runs ahead of the transport',
+        skip: _liveBaseUrl() == null
+            ? 'set VANE_TEST_BASE_URL to an https:// HTTP/3 host'
+            : null,
+        // package:test's default 30s would kill a 2 MiB WAN round-trip
+        // before the request's own 60s deadline gets a say.
+        timeout: const Timeout(Duration(seconds: 90)),
+        () async {
+          // The seam no other test spans: the upload pump's demand-driven
+          // pull loop feeding the REAL core's blocking
+          // vane_ffi_body_stream_write while a REAL network drains it. The
+          // pump unit tests prove lockstep against a fake that acks writes
+          // instantly, so a pump that buffered the whole source first would
+          // look identical there. Here the drain gauge is the core's own
+          // progress counter, read fresh at every pull (the production
+          // 100 ms poller would be too stale at WAN throughput), so a
+          // buffer-everything mutant records megabytes of overshoot before
+          // the QUIC handshake can carry a single body byte.
+          //
+          // Why the bound cannot flake, fast or slow: pull k happens only
+          // after write k-1 returned, and that write's admission required
+          // the core's queue to be under BODY_STREAM_BUFFER_BYTES
+          // (256 KiB), so consumed >= (k-1)*64KiB - 256KiB; uploadSent
+          // trails consumed by at most two in-flight chunks on either
+          // transport; hence produced <= sent + 256KiB + 3 chunks for a
+          // correct pump — code-order arithmetic, not a race. The asserted
+          // allowance adds three more chunks of slack: the generator runs
+          // one yield ahead of its pause today, and a future 1-chunk
+          // mailbox stage must not turn into a spurious failure. Slow
+          // networks cannot fail it either — the bound is one-sided, so
+          // the only slow-path exit is the request deadline.
+          const chunkBytes = 64 * 1024;
+          const chunkCount = 32; // 2 MiB total — 8x the core's buffer.
+          const allowance = 256 * 1024 + 6 * chunkBytes;
+
+          // A fresh client is a requirement, not tidiness: a connection
+          // another test already warmed would start this upload with
+          // different flow-control state, and closing the client below is
+          // what tears the transfer down before the next test runs.
+          final live = await platform.createClient(<String, Object?>{
+            'baseUrl': _liveBaseUrl(),
+            'timeoutSeconds': 60,
+          });
+          final progress = await platform.createProgress();
+          final records = <({int produced, int sent})>[];
+          final chunk = Uint8List.fromList(
+            List<int>.filled(chunkBytes, 0x76), // ASCII 'v'
+          );
+          // Demand-driven by construction: the generator suspends at each
+          // yield, and the upload pump pauses the subscription for the
+          // duration of every native write. Recording only, no expects —
+          // a failed assertion inside the source would wedge the upload.
+          Stream<Uint8List> source() async* {
+            for (var k = 0; k < chunkCount; k += 1) {
+              final snapshot = await platform.progressSnapshot(progress);
+              records.add(
+                (produced: k * chunkBytes, sent: snapshot.uploadSent),
+              );
+              yield chunk;
+            }
+          }
+
+          try {
+            final response = await platform.execute(live, <String, Object?>{
+              'url': '/post',
+              'method': 'POST',
+              'bodyStream': source(),
+              'bodyStreamContentLength': chunkBytes * chunkCount,
+              'progressId': progress,
+            });
+            // Deliberately not asserting httpVersion == http3: the
+            // invariant is transport-agnostic, and pinning the protocol
+            // would add an unrelated flake.
+            expect(response.statusCode, 200);
+            // Every chunk was pulled: an early-failing or short-circuited
+            // upload cannot vacuously pass the bound below.
+            expect(records.length, chunkCount);
+            for (final record in records) {
+              expect(
+                record.produced,
+                lessThanOrEqualTo(record.sent + allowance),
+                reason:
+                    'the source ran ${record.produced - record.sent} bytes '
+                    'ahead of the transport (allowance: $allowance)',
+              );
+            }
+          } finally {
+            await platform.freeProgress(progress);
+            await platform.closeClient(live);
+          }
+        },
+      );
+
+      test(
         'aborting a parked upload frees the native stream directly from '
         'this isolate, never through the writer mailbox',
         () async {
