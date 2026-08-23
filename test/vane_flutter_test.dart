@@ -174,6 +174,50 @@ void main() {
     VaneFlutterPlatform.instance = initialPlatform;
   });
 
+  test('configuration toMap carries the v5 knobs to the platform', () async {
+    final fakePlatform = MockVaneFlutterPlatform();
+    VaneFlutterPlatform.instance = fakePlatform;
+
+    // Defaults first, pinned to the numbers Rust's `Default` spells — the
+    // two sides must not drift the way maxIdleConnections once did.
+    await VaneClient().get('/defaults');
+    expect(fakePlatform.lastConfiguration?['maxRedirects'], 10);
+    expect(fakePlatform.lastConfiguration?['tlsMinVersion'], isNull);
+    expect(fakePlatform.lastConfiguration?['tlsMaxVersion'], isNull);
+    expect(fakePlatform.lastConfiguration?['customRootCertificates'], isEmpty);
+    expect(fakePlatform.lastConfiguration?['clientCertificate'], isNull);
+
+    final client = VaneClient(
+      configuration: const VaneConfiguration(
+        maxRedirects: 5,
+        tlsMinVersion: VaneTlsVersion.tls12,
+        tlsMaxVersion: VaneTlsVersion.tls13,
+        customRootCertificates: <String>['root-pem'],
+        clientCertificate: VaneClientCertificate(
+          certificatePem: 'cert-pem',
+          privateKeyPem: 'key-pem',
+        ),
+      ),
+    );
+    await client.get('/knobs');
+
+    expect(fakePlatform.lastConfiguration?['maxRedirects'], 5);
+    expect(fakePlatform.lastConfiguration?['tlsMinVersion'], 'tls12');
+    expect(fakePlatform.lastConfiguration?['tlsMaxVersion'], 'tls13');
+    expect(fakePlatform.lastConfiguration?['customRootCertificates'], <String>[
+      'root-pem',
+    ]);
+    expect(
+      fakePlatform.lastConfiguration?['clientCertificate'],
+      <String, String>{
+        'certificatePem': 'cert-pem',
+        'privateKeyPem': 'key-pem',
+      },
+    );
+
+    VaneFlutterPlatform.instance = initialPlatform;
+  });
+
   test('direct client methods apply request options', () async {
     final fakePlatform = MockVaneFlutterPlatform();
     VaneFlutterPlatform.instance = fakePlatform;

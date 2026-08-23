@@ -135,6 +135,11 @@ public class VaneFlutterPlugin: NSObject, FlutterPlugin {
     config.protocolMode = protocolMode(map["protocolMode"] as? String)
     config.proxyUrl = map["proxyUrl"] as? String
     config.proxyAuthorization = map["proxyAuthorization"] as? String
+    config.maxRedirects = uint32Value(map["maxRedirects"], fallback: config.maxRedirects)
+    config.tlsMinVersion = tlsVersion(map["tlsMinVersion"] as? String)
+    config.tlsMaxVersion = tlsVersion(map["tlsMaxVersion"] as? String)
+    config.customRootCertificates = stringList(map["customRootCertificates"])
+    config.clientCertificate = clientCertificate(map["clientCertificate"])
     return config
   }
 
@@ -153,6 +158,30 @@ public class VaneFlutterPlugin: NSObject, FlutterPlugin {
       progressId: optionalUInt64Value(map["progressId"]),
       timeoutSeconds: optionalUInt64Value(map["timeoutSeconds"]),
       followRedirects: boolValue(map["followRedirects"], fallback: true)
+    )
+  }
+
+  private func tlsVersion(_ value: String?) -> VaneTlsVersion? {
+    switch value {
+    case "tls12":
+      return .tls12
+    case "tls13":
+      return .tls13
+    default:
+      return nil
+    }
+  }
+
+  private func clientCertificate(_ value: Any?) -> VaneClientCertificate? {
+    guard let map = value as? [String: Any],
+      let certificatePem = map["certificatePem"] as? String,
+      let privateKeyPem = map["privateKeyPem"] as? String
+    else {
+      return nil
+    }
+    return VaneClientCertificate(
+      certificatePem: certificatePem,
+      privateKeyPem: privateKeyPem
     )
   }
 
@@ -202,6 +231,13 @@ public class VaneFlutterPlugin: NSObject, FlutterPlugin {
       return fallback
     }
     return number.uint64Value
+  }
+
+  private func uint32Value(_ value: Any?, fallback: UInt32) -> UInt32 {
+    guard let number = value as? NSNumber else {
+      return fallback
+    }
+    return number.uint32Value
   }
 
   private func optionalUInt64Value(_ value: Any?) -> UInt64? {

@@ -33,6 +33,33 @@ extension VaneProtocolModeName on VaneProtocolMode {
   }
 }
 
+enum VaneTlsVersion { tls12, tls13 }
+
+extension VaneTlsVersionName on VaneTlsVersion {
+  String get wireName {
+    switch (this) {
+      case VaneTlsVersion.tls12:
+        return 'tls12';
+      case VaneTlsVersion.tls13:
+        return 'tls13';
+    }
+  }
+}
+
+class VaneClientCertificate {
+  const VaneClientCertificate({
+    required this.certificatePem,
+    required this.privateKeyPem,
+  });
+
+  /// PEM, leaf first, optionally followed by intermediates (full chain).
+  final String certificatePem;
+
+  /// PEM PKCS#8, SEC1, or PKCS#1 private key. Never logged, never echoed in
+  /// errors by the core.
+  final String privateKeyPem;
+}
+
 class VaneConfiguration {
   const VaneConfiguration({
     this.baseUrl,
@@ -56,6 +83,11 @@ class VaneConfiguration {
     this.protocolMode = VaneProtocolMode.http3Only,
     this.proxyUrl,
     this.proxyAuthorization,
+    this.maxRedirects = 10,
+    this.tlsMinVersion,
+    this.tlsMaxVersion,
+    this.customRootCertificates = const <String>[],
+    this.clientCertificate,
   });
 
   final String? baseUrl;
@@ -80,6 +112,22 @@ class VaneConfiguration {
   final String? proxyUrl;
   final String? proxyAuthorization;
 
+  /// Redirect hop cap when redirects are followed; the core rejects
+  /// values above 64.
+  final int maxRedirects;
+
+  /// Null means the stack default (TLS 1.2 + 1.3 over TCP; HTTP/3 is always
+  /// TLS 1.3). A `tls12` maximum is rejected with an HTTP/3-capable
+  /// [protocolMode] — QUIC mandates TLS 1.3.
+  final VaneTlsVersion? tlsMinVersion;
+  final VaneTlsVersion? tlsMaxVersion;
+
+  /// PEM certificate bundles ADDED to platform trust (never replacing it).
+  final List<String> customRootCertificates;
+
+  /// Client identity for mutual TLS.
+  final VaneClientCertificate? clientCertificate;
+
   Map<String, Object?> toMap() {
     return <String, Object?>{
       'baseUrl': baseUrl,
@@ -103,6 +151,16 @@ class VaneConfiguration {
       'protocolMode': protocolMode.wireName,
       'proxyUrl': proxyUrl,
       'proxyAuthorization': proxyAuthorization,
+      'maxRedirects': maxRedirects,
+      'tlsMinVersion': tlsMinVersion?.wireName,
+      'tlsMaxVersion': tlsMaxVersion?.wireName,
+      'customRootCertificates': customRootCertificates,
+      'clientCertificate': clientCertificate == null
+          ? null
+          : <String, String>{
+              'certificatePem': clientCertificate!.certificatePem,
+              'privateKeyPem': clientCertificate!.privateKeyPem,
+            },
     };
   }
 }

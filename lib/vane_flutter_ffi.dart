@@ -98,6 +98,32 @@ final class _VaneFfiClientConfig extends Struct {
 
   external _VaneFfiString proxyUrl;
   external _VaneFfiString proxyAuthorization;
+
+  // -------- appended in ABI v5; declaration order IS the offset --------
+
+  /// Redirect hop cap; callers pass 10 for the default. Values > 64 are
+  /// rejected at client creation.
+  @Uint32()
+  external int maxRedirects;
+
+  /// 0 = unset, 12 = TLS 1.2, 13 = TLS 1.3. Anything else is an error.
+  @Uint8()
+  external int tlsMinVersion;
+
+  @Uint8()
+  external int tlsMaxVersion;
+
+  // 2 bytes tail padding here before the next 8-aligned pointer — deliberate;
+  // do NOT fill them later without a bump (the VaneFfiResponse padding
+  // lesson).
+
+  /// Concatenated PEM bundle; empty = none. Becomes a one-element
+  /// custom_root_certificates vec in the core (PEM is concatenation-safe).
+  external _VaneFfiString customRootCaPem;
+
+  /// PEM leaf-first chain; empty = none. Must be set together with the key.
+  external _VaneFfiString clientCertificatePem;
+  external _VaneFfiString clientPrivateKeyPem;
 }
 
 final class _VaneFfiRequest extends Struct {
@@ -188,6 +214,14 @@ final class _VaneFfiResponse extends Struct {
   external _VaneFfiBuffer bodyFilePath;
   external _VaneFfiBuffer url;
   external _VaneFfiBuffer error;
+
+  /// IP literal of the socket peer ("203.0.113.7"); empty = unknown. Appended
+  /// in ABI v5 — the padding after [isSuccess] was spent in v3, so this GROWS
+  /// the struct. Always empty until batch 2 of the v5 rollout fills it (and
+  /// the response model starts reading it); declared now because the layout
+  /// is the v5 contract. Freed with the rest of the response by
+  /// `vane_ffi_response_free`.
+  external _VaneFfiBuffer remoteIp;
 }
 
 final class _VaneFfiProgress extends Struct {
@@ -223,9 +257,17 @@ final class _VaneFfiStreamChunk extends Struct {
 }
 
 typedef _ClientCreateNative =
-    Uint64 Function(Pointer<_VaneFfiClientConfig>, Pointer<_VaneFfiBuffer>);
+    Uint64 Function(
+      Pointer<_VaneFfiClientConfig>,
+      Pointer<_VaneFfiBuffer>,
+      Pointer<Uint32>,
+    );
 typedef _ClientCreateDart =
-    int Function(Pointer<_VaneFfiClientConfig>, Pointer<_VaneFfiBuffer>);
+    int Function(
+      Pointer<_VaneFfiClientConfig>,
+      Pointer<_VaneFfiBuffer>,
+      Pointer<Uint32>,
+    );
 typedef _ClientCloseNative = Void Function(Uint64);
 typedef _ClientCloseDart = void Function(int);
 typedef _SetCertificatePinsNative =
@@ -318,7 +360,16 @@ typedef _BodyStreamFinishDart = int Function(int, Pointer<_VaneFfiBuffer>);
 /// `bodyStreamId`. That was a struct GROWTH, not a padding fill: a v3
 /// library reading this package's request struct — or the reverse — would
 /// misread past the end, which is precisely the skew this constant refuses.
-const int _expectedAbiVersion = 4;
+///
+/// v5: the config knobs — `_VaneFfiClientConfig` gained `maxRedirects`,
+/// `tlsMinVersion`/`tlsMaxVersion`, `customRootCaPem`,
+/// `clientCertificatePem`/`clientPrivateKeyPem`; `_VaneFfiResponse` gained
+/// `remoteIp` (a struct GROWTH, like v4's); `vane_ffi_client_create` gained
+/// an `out_error_kind` out-param — a SIGNATURE change, so a skewed pairing
+/// would corrupt the call frame, not just misread a struct — and the DNS
+/// resolver symbols (`vane_ffi_set_dns_resolver`,
+/// `vane_ffi_dns_resolver_reply`) joined the contract as stubs.
+const int _expectedAbiVersion = 5;
 
 /// Verifies the native library speaks this package's C ABI, and returns it.
 ///
@@ -1702,18 +1753,25 @@ class _VaneFfiBindings {
   int createClient(Map<String, Object?> configuration) {
     final config = _NativeConfig(configuration);
     final error = calloc<_VaneFfiBuffer>();
+    // Written by the native side only when creation fails; calloc's zero is
+    // `unknown`, so an unwritten value classifies the same as pre-v5.
+    final errorKind = calloc<Uint32>();
     try {
-      final handle = _clientCreate(config.pointer, error);
+      final handle = _clientCreate(config.pointer, error, errorKind);
       final message = _readString(error.ref);
       if (message.isNotEmpty) {
         _bufferFree(error.ref);
-        throw VaneHttpException(message);
+        // v5: the kind rides the out-param, so a config the core rejects
+        // throws `invalidRequest` — parity with Swift/Kotlin's typed
+        // VaneError instead of the old `kind: unknown`.
+        throw VaneHttpException(message, kind: _errorKind(errorKind.value));
       }
       if (handle == 0) {
         throw const VaneHttpException('Native Vane client creation failed.');
       }
       return handle;
     } finally {
+      calloc.free(errorKind);
       calloc.free(error);
       config.free();
     }
@@ -2020,6 +2078,16 @@ class _NativeConfig {
       proxyUrl = _NativeString(config['proxyUrl'] as String?),
       proxyAuthorization = _NativeString(
         config['proxyAuthorization'] as String?,
+      ),
+      // One concatenated bundle over the C ABI; PEM is concatenation-safe.
+      customRootCaPem = _NativeString(
+        _pemBundle(config['customRootCertificates']),
+      ),
+      clientCertificatePem = _NativeString(
+        _nestedString(config['clientCertificate'], 'certificatePem'),
+      ),
+      clientPrivateKeyPem = _NativeString(
+        _nestedString(config['clientCertificate'], 'privateKeyPem'),
       ) {
     final ref = pointer.ref;
     baseUrl.writeTo(ref.baseUrl);
@@ -2050,6 +2118,12 @@ class _NativeConfig {
     ref.protocolMode = _protocolMode(config['protocolMode'] as String?);
     proxyUrl.writeTo(ref.proxyUrl);
     proxyAuthorization.writeTo(ref.proxyAuthorization);
+    ref.maxRedirects = config['maxRedirects'] as int? ?? 10;
+    ref.tlsMinVersion = _tlsVersionByte(config['tlsMinVersion'] as String?);
+    ref.tlsMaxVersion = _tlsVersionByte(config['tlsMaxVersion'] as String?);
+    customRootCaPem.writeTo(ref.customRootCaPem);
+    clientCertificatePem.writeTo(ref.clientCertificatePem);
+    clientPrivateKeyPem.writeTo(ref.clientPrivateKeyPem);
   }
 
   final Pointer<_VaneFfiClientConfig> pointer;
@@ -2061,8 +2135,14 @@ class _NativeConfig {
   final _NativeString userAgent;
   final _NativeString proxyUrl;
   final _NativeString proxyAuthorization;
+  final _NativeString customRootCaPem;
+  final _NativeString clientCertificatePem;
+  final _NativeString clientPrivateKeyPem;
 
   void free() {
+    clientPrivateKeyPem.free();
+    clientCertificatePem.free();
+    customRootCaPem.free();
     proxyAuthorization.free();
     proxyUrl.free();
     userAgent.free();
@@ -2270,6 +2350,35 @@ Map<String, List<String>> _stringListMap(Object? value) {
       values.map((item) => item.toString()).toList(),
     );
   });
+}
+
+/// Joins the PEM bundle list into the single string the C ABI carries; null
+/// (an empty `customRootCaPem`) is how "no custom roots" crosses.
+String? _pemBundle(Object? value) {
+  final list = (value as List<Object?>?) ?? const <Object?>[];
+  if (list.isEmpty) {
+    return null;
+  }
+  return list.map((item) => item.toString()).join('\n');
+}
+
+String? _nestedString(Object? value, String key) {
+  final map = value as Map<Object?, Object?>?;
+  return map?[key] as String?;
+}
+
+/// Twin of the native `ffi_tls_version` decoder: 0 unset, 12, 13.
+int _tlsVersionByte(String? value) {
+  switch (value) {
+    case null:
+      return 0;
+    case 'tls12':
+      return 12;
+    case 'tls13':
+      return 13;
+    default:
+      throw VaneHttpException('Invalid Vane TLS version: $value');
+  }
 }
 
 int _protocolMode(String? value) {

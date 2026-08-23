@@ -1,9 +1,11 @@
 package com.inteniquetic.vane_flutter
 
 import com.inteniquetic.vanekotlin.VaneClient
+import com.inteniquetic.vanekotlin.VaneClientCertificate
 import com.inteniquetic.vanekotlin.VaneClientConfig
 import com.inteniquetic.vanekotlin.VaneProtocolMode
 import com.inteniquetic.vanekotlin.VaneRequest
+import com.inteniquetic.vanekotlin.VaneTlsVersion
 import com.inteniquetic.vanekotlin.createDefaultConfig
 import com.inteniquetic.vanekotlin.createVaneClient
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -132,6 +134,11 @@ class VaneFlutterPlugin : FlutterPlugin, MethodCallHandler {
             protocolMode = protocolMode(map["protocolMode"] as String?)
             proxyUrl = map["proxyUrl"] as String?
             proxyAuthorization = map["proxyAuthorization"] as String?
+            maxRedirects = uintValue(map["maxRedirects"], maxRedirects)
+            tlsMinVersion = tlsVersion(map["tlsMinVersion"] as String?)
+            tlsMaxVersion = tlsVersion(map["tlsMaxVersion"] as String?)
+            customRootCertificates = stringList(map["customRootCertificates"])
+            clientCertificate = clientCertificate(map["clientCertificate"])
         }
     }
 
@@ -166,6 +173,22 @@ class VaneFlutterPlugin : FlutterPlugin, MethodCallHandler {
             "setCookie" to setCookie,
             "httpVersion" to httpVersion?.name?.lowercase()
         )
+    }
+
+    private fun tlsVersion(value: String?): VaneTlsVersion? {
+        return when (value) {
+            "tls12" -> VaneTlsVersion.TLS12
+            "tls13" -> VaneTlsVersion.TLS13
+            else -> null
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun clientCertificate(value: Any?): VaneClientCertificate? {
+        val map = value as? Map<Any?, Any?> ?: return null
+        val certificatePem = map["certificatePem"] as? String ?: return null
+        val privateKeyPem = map["privateKeyPem"] as? String ?: return null
+        return VaneClientCertificate(certificatePem, privateKeyPem)
     }
 
     private fun protocolMode(value: String?): VaneProtocolMode {
@@ -206,6 +229,10 @@ class VaneFlutterPlugin : FlutterPlugin, MethodCallHandler {
 
     private fun ulongValue(value: Any?, fallback: ULong): ULong {
         return (value as? Number)?.toLong()?.toULong() ?: fallback
+    }
+
+    private fun uintValue(value: Any?, fallback: UInt): UInt {
+        return (value as? Number)?.toInt()?.toUInt() ?: fallback
     }
 
     private fun nullableULongValue(value: Any?): ULong? {

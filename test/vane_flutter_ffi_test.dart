@@ -93,7 +93,7 @@ void main() {
           isA<VaneHttpException>().having(
             (e) => e.message,
             'message',
-            allOf(contains('vane_ffi_abi_version'), contains('ABI v4')),
+            allOf(contains('vane_ffi_abi_version'), contains('ABI v5')),
           ),
         ),
       );
@@ -129,20 +129,20 @@ void main() {
       /// the library through [verifyNativeAbi], so every test here already
       /// proves an injected, matching library passes. This pins the mismatch
       /// branch against the real symbol, naming both versions — and
-      /// `expected: 3` is not an arbitrary wrong number: it is exactly the
-      /// pairing the v4 struct growth creates (a v3-era plugin loading this
-      /// library), the skew that would misread `VaneFfiRequest` past its end
-      /// if the guard ever stopped firing.
+      /// `expected: 4` is not an arbitrary wrong number: it is exactly the
+      /// pairing the v5 `vane_ffi_client_create` signature change creates (a
+      /// v4-era plugin loading this library), the skew that would corrupt the
+      /// create call frame if the guard ever stopped firing.
       test('an ABI version mismatch is refused, naming both versions', () {
         final library = DynamicLibrary.open(libraryPath!);
         expect(verifyNativeAbi(library), same(library));
         expect(
-          () => verifyNativeAbi(library, expected: 3),
+          () => verifyNativeAbi(library, expected: 4),
           throwsA(
             isA<VaneHttpException>().having(
               (e) => e.message,
               'message',
-              allOf(contains('ABI v4'), contains('v3')),
+              allOf(contains('ABI v5'), contains('v4')),
             ),
           ),
         );
@@ -223,6 +223,35 @@ void main() {
 
         await platform.closeClient(based);
       });
+
+      test(
+        'a rejected config reports its error kind through create',
+        () async {
+          // v5's `out_error_kind` on `vane_ffi_client_create`: a config
+          // `VaneClient::new` refuses must throw `invalidRequest`, parity
+          // with Swift/Kotlin's typed VaneError — not the pre-v5 `unknown`.
+          // Three different rejections, so this also proves the new struct
+          // members (u32 cap, version bytes, nested certificate strings)
+          // land at the offsets the native decoder reads.
+          await expectLater(
+            platform.createClient(<String, Object?>{'maxRedirects': 65}),
+            _failsWithKind(VaneErrorKind.invalidRequest),
+          );
+          await expectLater(
+            platform.createClient(<String, Object?>{
+              'tlsMinVersion': 'tls13',
+              'tlsMaxVersion': 'tls12',
+            }),
+            _failsWithKind(VaneErrorKind.invalidRequest),
+          );
+          await expectLater(
+            platform.createClient(<String, Object?>{
+              'clientCertificate': <String, String>{'certificatePem': 'x'},
+            }),
+            _failsWithKind(VaneErrorKind.invalidRequest),
+          );
+        },
+      );
 
       test('warmup is best-effort and never throws across the FFI', () async {
         // Unresolvable host: the native side swallows the failure by
