@@ -253,6 +253,46 @@ void main() {
         },
       );
 
+      test('valid trust knobs cross the ABI and create a client', () async {
+        // The construction guards are real wiring now: a config carrying
+        // valid customRootCertificates and clientCertificate PEM must parse
+        // (roots), match (cert against key), and yield a live client — not
+        // the old "not implemented yet" `invalidRequest`. The fixture is a
+        // static self-signed cert reused as both root and client identity,
+        // so the same pair also proves the cert/key match check accepts a
+        // genuine pair through the nested-string marshalling the rejection
+        // test above exercises only negatively.
+        const certPem = '''
+-----BEGIN CERTIFICATE-----
+MIIBmTCCAT+gAwIBAgIUDVcg8aPeE3uDu8UtE8/KenvjnFYwCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWdmFuZS1kYXJ0LXRlc3QtZml4dHVyZTAgFw0yNjA4MjMxNTU1
+MjFaGA8yMTI2MDczMDE1NTUyMVowITEfMB0GA1UEAwwWdmFuZS1kYXJ0LXRlc3Qt
+Zml4dHVyZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABE/rfkko9mwBDqb7WDak
+2HHWhHR3Y6FDLk4JTrsNA/f96Wlfiub3n55C5DOt5G9lWEcIFKkPnuLBLAxG0m/x
+2JSjUzBRMB0GA1UdDgQWBBStZzJPap5TJThrfXQLXwUTmx319zAfBgNVHSMEGDAW
+gBStZzJPap5TJThrfXQLXwUTmx319zAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49
+BAMCA0gAMEUCIQCbypMuLn2+EDmZBtrl2p9e6DZgIU24HrMnL4JrgJDJbQIgX/7B
+p8aZeOVWFKUXFXNjT3H62iMBtnlnHI6bo7PjTWY=
+-----END CERTIFICATE-----
+''';
+        const keyPem = '''
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgWtGZpebcnlQ5qjM6
+QTcpB1AkmKwTgpBxj7Jj2QPHE5qhRANCAARP635JKPZsAQ6m+1g2pNhx1oR0d2Oh
+Qy5OCU67DQP3/elpX4rm95+eQuQzreRvZVhHCBSpD57iwSwMRtJv8diU
+-----END PRIVATE KEY-----
+''';
+        final trusted = await platform.createClient(<String, Object?>{
+          'customRootCertificates': <String>[certPem],
+          'clientCertificate': <String, String>{
+            'certificatePem': certPem,
+            'privateKeyPem': keyPem,
+          },
+        });
+        expect(trusted, isNot(0));
+        await platform.closeClient(trusted);
+      });
+
       test('warmup is best-effort and never throws across the FFI', () async {
         // Unresolvable host: the native side swallows the failure by
         // contract, so these completing at all is the assertion — of the
