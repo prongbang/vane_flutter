@@ -1117,4 +1117,179 @@ Qy5OCU67DQP3/elpX4rm95+eQuQzreRvZVhHCBSpD57iwSwMRtJv8diU
       );
     },
   );
+
+  group(
+    'DNS resolver rendezvous',
+    skip: libraryPath == null ? 'libvane is not built' : null,
+    () {
+      late FfiVaneFlutter platform;
+
+      setUpAll(() {
+        platform = FfiVaneFlutter(library: DynamicLibrary.open(libraryPath!));
+      });
+
+      tearDownAll(() {
+        platform.dispose();
+      });
+
+      Future<int> resolverClient({int timeoutSeconds = 5}) {
+        // TCP-only: a steered connect to a closed local port fails fast and
+        // deterministically, where a closed UDP port's failure shape varies.
+        return platform.createClient(<String, Object?>{
+          'protocolMode': 'http1Only',
+          'timeoutSeconds': timeoutSeconds,
+        });
+      }
+
+      /// A local port with nothing behind it: bound, read, released.
+      Future<int> closedPort() async {
+        final socket = await ServerSocket.bind(
+          InternetAddress.loopbackIPv4,
+          0,
+        );
+        final port = socket.port;
+        await socket.close();
+        return port;
+      }
+
+      test('a resolver reply round-trips the rendezvous and steers the '
+          'socket', () async {
+        final client = await resolverClient();
+        final port = await closedPort();
+        final resolved = <String>[];
+        await platform.setDnsResolver(client, (host) async {
+          resolved.add(host);
+          return <String>['127.0.0.1'];
+        });
+
+        final started = DateTime.now();
+        await expectLater(
+          platform.execute(client, <String, Object?>{
+            'url': 'https://dns-rendezvous.invalid:$port/probe',
+            'method': 'GET',
+          }),
+          throwsA(isA<VaneHttpException>()),
+        );
+        final elapsed = DateTime.now().difference(started);
+
+        // The recorded host proves the callback crossed to Dart; failing in
+        // well under both the 5 s client timeout and the 10 s rendezvous
+        // budget proves the REPLY crossed back and the connect to the
+        // steered (closed) port is what failed. `.invalid` never resolves,
+        // so the system resolver cannot have supplied the address.
+        expect(resolved, <String>['dns-rendezvous.invalid']);
+        expect(elapsed, lessThan(const Duration(seconds: 4)));
+        await platform.closeClient(client);
+      });
+
+      test('a resolver that never replies times the request out as a clean '
+          'transport error', () async {
+        // The client timeout must outlive the 10 s rendezvous budget, so the
+        // budget is what surfaces.
+        final client = await resolverClient(timeoutSeconds: 15);
+        await platform.setDnsResolver(
+          client,
+          (host) => Completer<List<String>>().future,
+        );
+
+        await expectLater(
+          platform
+              .execute(client, <String, Object?>{
+                'url': 'https://dns-black-hole.invalid/probe',
+                'method': 'GET',
+              })
+              .timeout(const Duration(seconds: 14)),
+          throwsA(
+            isA<VaneHttpException>().having(
+              (e) => e.message,
+              'message',
+              contains('dns resolver timed out'),
+            ),
+          ),
+        );
+        await platform.closeClient(client);
+      });
+
+      test('a reply that lands after the rendezvous timeout is a safe no-op',
+          () async {
+        final client = await resolverClient(timeoutSeconds: 15);
+        final lateReply = Completer<List<String>>();
+        var calls = 0;
+        await platform.setDnsResolver(client, (host) {
+          calls += 1;
+          return calls == 1 ? lateReply.future : <String>['127.0.0.1'];
+        });
+
+        await expectLater(
+          platform
+              .execute(client, <String, Object?>{
+                'url': 'https://dns-late-reply.invalid/probe',
+                'method': 'GET',
+              })
+              .timeout(const Duration(seconds: 14)),
+          throwsA(
+            isA<VaneHttpException>().having(
+              (e) => e.message,
+              'message',
+              contains('dns resolver timed out'),
+            ),
+          ),
+        );
+
+        // The waiter is long gone; completing now drives the late reply
+        // through vane_ffi_dns_resolver_reply against a tombstoned id.
+        lateReply.complete(<String>['127.0.0.1']);
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+
+        // No crash, and the machinery still works: a fresh resolution
+        // round-trips as in the first test.
+        final port = await closedPort();
+        await expectLater(
+          platform.execute(client, <String, Object?>{
+            'url': 'https://dns-after-late.invalid:$port/probe',
+            'method': 'GET',
+          }),
+          throwsA(isA<VaneHttpException>()),
+        );
+        expect(calls, 2);
+        await platform.closeClient(client);
+      });
+
+      test('closing the client with a resolution in flight fails it cleanly',
+          () async {
+        final client = await resolverClient(timeoutSeconds: 15);
+        final parked = Completer<List<String>>();
+        final reached = Completer<void>();
+        await platform.setDnsResolver(client, (host) {
+          if (!reached.isCompleted) {
+            reached.complete();
+          }
+          return parked.future;
+        });
+
+        final pending = platform.execute(client, <String, Object?>{
+          'url': 'https://dns-close-in-flight.invalid/probe',
+          'method': 'GET',
+        });
+        // Only close once the request is provably parked in the resolver.
+        await reached.future.timeout(const Duration(seconds: 5));
+        await platform.closeClient(client);
+
+        await expectLater(
+          pending.timeout(const Duration(seconds: 10)),
+          throwsA(
+            isA<VaneHttpException>().having(
+              (e) => e.message,
+              'message',
+              contains('was abandoned'),
+            ),
+          ),
+        );
+
+        // The straggler reply against the settled id must also be inert.
+        parked.complete(<String>['127.0.0.1']);
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      });
+    },
+  );
 }

@@ -308,6 +308,22 @@ typedef _ProgressSnapshotNative = _VaneFfiProgress Function(Uint64);
 typedef _ProgressSnapshotDart = _VaneFfiProgress Function(int);
 typedef _WarmupNative = Void Function(Uint64, _VaneFfiString);
 typedef _WarmupDart = void Function(int, _VaneFfiString);
+typedef _DnsResolveCallbackNative =
+    Void Function(Uint64, _VaneFfiString, Pointer<Void>);
+typedef _SetDnsResolverNative =
+    Bool Function(
+      Uint64,
+      Pointer<NativeFunction<_DnsResolveCallbackNative>>,
+      Pointer<Void>,
+    );
+typedef _SetDnsResolverDart =
+    bool Function(
+      int,
+      Pointer<NativeFunction<_DnsResolveCallbackNative>>,
+      Pointer<Void>,
+    );
+typedef _DnsResolverReplyNative = Void Function(Uint64, _VaneFfiString, Bool);
+typedef _DnsResolverReplyDart = void Function(int, _VaneFfiString, bool);
 typedef _ExecuteStreamingNative =
     Pointer<_VaneFfiResponse> Function(
       Uint64,
@@ -619,10 +635,68 @@ class FfiVaneFlutter extends VaneFlutterPlatform {
     // timeout: the core's release latch fails the next write.
   }
 
+  /// One listener per client with a resolver installed. Each keeps this
+  /// isolate alive until closed, so [closeClient] (and replacement below)
+  /// must retire them.
+  final Map<int, NativeCallable<_DnsResolveCallbackNative>> _dnsCallables =
+      <int, NativeCallable<_DnsResolveCallbackNative>>{};
+
+  @override
+  Future<void> setDnsResolver(int handle, VaneDnsResolver? resolver) async {
+    if (resolver == null) {
+      _nativeBindings.setDnsResolver(handle, nullptr);
+      _dnsCallables.remove(handle)?.close();
+      return;
+    }
+    void onResolve(int requestId, _VaneFfiString host, Pointer<Void> _) {
+      // Decoded before anything can await: the pointer is owned by the
+      // native rendezvous entry and this synchronous read is the narrow
+      // window the entry is contractually alive for.
+      final String hostName;
+      try {
+        hostName = host.data == nullptr || host.len == 0
+            ? ''
+            : utf8.decode(host.data.asTypedList(host.len));
+      } catch (_) {
+        _nativeBindings.dnsResolverReply(requestId, '', isError: true);
+        return;
+      }
+      Future<List<String>>.sync(() async => resolver(hostName)).then(
+        (ips) => _nativeBindings.dnsResolverReply(
+          requestId,
+          ips.join('\n'),
+          isError: false,
+        ),
+        // The resolver throwing is a loud Transport failure on the waiting
+        // request, never a silent fallback to the system resolver.
+        onError: (Object _) =>
+            _nativeBindings.dnsResolverReply(requestId, '', isError: true),
+      );
+    }
+
+    final callable = NativeCallable<_DnsResolveCallbackNative>.listener(
+      onResolve,
+    );
+    if (!_nativeBindings.setDnsResolver(handle, callable.nativeFunction)) {
+      callable.close();
+      throw const VaneHttpException(
+        'Native Vane DNS resolver install failed: unknown client.',
+      );
+    }
+    // Closed only after the replacement is installed: the old listener may
+    // still owe replies for resolutions already in flight.
+    final previous = _dnsCallables[handle];
+    _dnsCallables[handle] = callable;
+    previous?.close();
+  }
+
   @override
   Future<void> closeClient(int handle) async {
     _baseUrls.remove(handle);
     _nativeBindings.closeClient(handle);
+    // After the native close: close settles this client's in-flight
+    // resolutions first, so no new callback can be posted to the listener.
+    _dnsCallables.remove(handle)?.close();
   }
 
   @override
@@ -1675,6 +1749,17 @@ class _VaneFfiBindings {
           .lookupFunction<_SetCertificatePinsNative, _SetCertificatePinsDart>(
             'vane_ffi_client_set_certificate_pins',
           ),
+      _setDnsResolver = library
+          .lookupFunction<_SetDnsResolverNative, _SetDnsResolverDart>(
+            'vane_ffi_set_dns_resolver',
+          ),
+      // Leaf like the id-table calls: fills the rendezvous slot and signals
+      // the parked waiter — no callbacks into Dart, no blocking work.
+      _dnsResolverReply = library
+          .lookupFunction<_DnsResolverReplyNative, _DnsResolverReplyDart>(
+            'vane_ffi_dns_resolver_reply',
+            isLeaf: true,
+          ),
       // isLeaf: these are id-table lookups and deallocations — no callbacks
       // into Dart, no blocking work. vane_ffi_execute and the client calls
       // stay non-leaf because they can run for the whole request.
@@ -1736,6 +1821,8 @@ class _VaneFfiBindings {
   final _ClientCreateDart _clientCreate;
   final _ClientCloseDart _clientClose;
   final _SetCertificatePinsDart _setCertificatePins;
+  final _SetDnsResolverDart _setDnsResolver;
+  final _DnsResolverReplyDart _dnsResolverReply;
   final _ResponseFreeDart _responseFree;
   final Pointer<NativeFinalizerFunction> _responseFinalizer;
   final _BufferFreeDart _bufferFree;
@@ -1828,6 +1915,27 @@ class _VaneFfiBindings {
 
   void closeClient(int handle) {
     _clientClose(handle);
+  }
+
+  bool setDnsResolver(
+    int handle,
+    Pointer<NativeFunction<_DnsResolveCallbackNative>> callback,
+  ) {
+    return _setDnsResolver(handle, callback, nullptr);
+  }
+
+  void dnsResolverReply(int requestId, String ips, {required bool isError}) {
+    final nativeIps = _NativeString(ips);
+    final value = calloc<_VaneFfiString>();
+    try {
+      nativeIps.writeTo(value.ref);
+      // The native side copies the buffer out before returning, so freeing
+      // in the finally is safe.
+      _dnsResolverReply(requestId, value.ref, isError);
+    } finally {
+      calloc.free(value);
+      nativeIps.free();
+    }
   }
 
   void setCertificatePins(int handle, String host, List<String> pins) {

@@ -50,6 +50,14 @@ abstract class VaneFlutterPlatform extends PlatformInterface {
     throw UnimplementedError('setCertificatePins() has not been implemented.');
   }
 
+  /// Installs (null clears) the caller-supplied DNS resolver; see
+  /// `VaneClient.setDnsResolver`. Only the FFI platform implements this —
+  /// like [executeStreaming], a per-lookup native callback cannot be
+  /// expressed over a request/response method channel.
+  Future<void> setDnsResolver(int handle, VaneDnsResolver? resolver) {
+    throw UnimplementedError('setDnsResolver() has not been implemented.');
+  }
+
   /// Best-effort warm-up of the client behind [handle]; see
   /// `VaneClient.warmup`. Defaults to a no-op rather than
   /// [UnimplementedError]: warmup is a performance affordance whose failures

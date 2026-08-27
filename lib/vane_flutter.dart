@@ -467,6 +467,18 @@ typedef VaneErrorInterceptor =
     FutureOr<VaneResponse?> Function(Object, StackTrace);
 typedef VaneProgressCallback = void Function(int transferred, int total);
 
+/// A caller-supplied DNS resolver: IP address literals for [host]
+/// ("203.0.113.7", "2001:db8::1") — no ports, no hostnames. Consulted for
+/// every host between the configuration's `dnsOverrides` map (which wins on
+/// an exact host match) and the system resolver, which is never used once a
+/// resolver is installed. Runs on this isolate's event loop while the
+/// request's worker waits — keep it fast, and never resolve by making a Vane
+/// request. Failure is loud: throwing, or returning an empty list or a
+/// non-IP entry, fails the waiting request with a transport error; a
+/// resolver that takes longer than the native 10 s rendezvous budget times
+/// the request out.
+typedef VaneDnsResolver = FutureOr<List<String>> Function(String host);
+
 class VaneRequestOptions {
   const VaneRequestOptions({
     this.headers = const <String, String>{},
@@ -793,6 +805,17 @@ class VaneClient {
   Future<void> setCertificatePins(String host, List<String> pins) async {
     final handle = await _ensureHandle();
     await _platform.setCertificatePins(handle, host, pins);
+  }
+
+  /// Installs (or, with null, clears) a caller-supplied [VaneDnsResolver].
+  ///
+  /// Setting it before the first request is the documented fast path.
+  /// Setting it later is still correct, just costs the pools: the switch
+  /// drains the connection pools and warmup state, because a pooled
+  /// connection was resolved under the previous resolver.
+  Future<void> setDnsResolver(VaneDnsResolver? resolver) async {
+    final handle = await _ensureHandle();
+    await _platform.setDnsResolver(handle, resolver);
   }
 
   /// Best-effort warm-up of this client's one-time setup and connection
