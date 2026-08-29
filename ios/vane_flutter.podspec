@@ -10,7 +10,7 @@ Pod::Spec.new do |s|
 Flutter bindings for the Vane HTTP/3 client backed by the shared Rust core.
                        DESC
   s.homepage         = 'https://github.com/inteniquetic/vane'
-  s.license          = { :file => '../LICENSE' }
+  s.license          = { :type => 'MIT OR Apache-2.0', :file => '../LICENSE' }
   s.author           = { 'INTENIQUETIC' => 'prongbang@gmail.com' }
   s.source           = { :path => '.' }
   s.source_files = [
