@@ -107,4 +107,4 @@ Vane.addResponseInterceptor((response) => response);
 Vane.clearInterceptors();
 ```
 
-Android currently requires `minSdk = 33`, matching `VaneKotlin`.
+Android requires `minSdk = 29` (Android 10), matching `VaneKotlin`.
