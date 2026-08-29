@@ -70,6 +70,14 @@ class _RecordingPlatform
   @override
   Future<void> warmup(int handle, String? url) async {}
 
+  // Only the FFI platform implements this -- a per-lookup native callback
+  // cannot cross a method channel -- so the mock keeps the base class's
+  // contract rather than inventing behaviour these tests never exercise.
+  @override
+  Future<void> setDnsResolver(int handle, VaneDnsResolver? resolver) {
+    throw UnimplementedError('setDnsResolver() has not been implemented.');
+  }
+
   @override
   Future<int> createCancelToken() async => 1;
 
