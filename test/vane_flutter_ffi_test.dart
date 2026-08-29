@@ -93,7 +93,7 @@ void main() {
           isA<VaneHttpException>().having(
             (e) => e.message,
             'message',
-            allOf(contains('vane_ffi_abi_version'), contains('ABI v5')),
+            allOf(contains('vane_ffi_abi_version'), contains('ABI v6')),
           ),
         ),
       );
@@ -129,20 +129,21 @@ void main() {
       /// the library through [verifyNativeAbi], so every test here already
       /// proves an injected, matching library passes. This pins the mismatch
       /// branch against the real symbol, naming both versions — and
-      /// `expected: 4` is not an arbitrary wrong number: it is exactly the
-      /// pairing the v5 `vane_ffi_client_create` signature change creates (a
-      /// v4-era plugin loading this library), the skew that would corrupt the
-      /// create call frame if the guard ever stopped firing.
+      /// `expected: 5` is not an arbitrary wrong number: it is exactly the
+      /// pairing v6 creates — a v5-era plugin loading this library, whose
+      /// `_VaneFfiClientConfig` is one Int64 shorter than the one the core
+      /// reads. If the guard ever stopped firing, the core would read
+      /// `inactivityTimeoutSeconds` off the end of the caller's struct.
       test('an ABI version mismatch is refused, naming both versions', () {
         final library = DynamicLibrary.open(libraryPath!);
         expect(verifyNativeAbi(library), same(library));
         expect(
-          () => verifyNativeAbi(library, expected: 4),
+          () => verifyNativeAbi(library, expected: 5),
           throwsA(
             isA<VaneHttpException>().having(
               (e) => e.message,
               'message',
-              allOf(contains('ABI v5'), contains('v4')),
+              allOf(contains('ABI v6'), contains('v5')),
             ),
           ),
         );

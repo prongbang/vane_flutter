@@ -124,6 +124,14 @@ final class _VaneFfiClientConfig extends Struct {
   /// PEM leaf-first chain; empty = none. Must be set together with the key.
   external _VaneFfiString clientCertificatePem;
   external _VaneFfiString clientPrivateKeyPem;
+
+  // -------- appended in ABI v6; order is offset --------
+
+  /// Seconds of no forward progress after which an HTTP/3 request fails, in
+  /// place of `timeoutSeconds` bounding the request as a whole. Negative =
+  /// unset, the same negative-means-none dialect as `timeoutSeconds`.
+  @Int64()
+  external int inactivityTimeoutSeconds;
 }
 
 final class _VaneFfiRequest extends Struct {
@@ -383,7 +391,14 @@ typedef _BodyStreamFinishDart = int Function(int, Pointer<_VaneFfiBuffer>);
 /// would corrupt the call frame, not just misread a struct — and the DNS
 /// resolver symbols (`vane_ffi_set_dns_resolver`,
 /// `vane_ffi_dns_resolver_reply`) joined the contract as stubs.
-const int _expectedAbiVersion = 5;
+///
+/// v6: `_VaneFfiClientConfig` gained `inactivityTimeoutSeconds`. Another
+/// struct GROWTH, not a padding fill — an Int64 cannot ride the tail padding
+/// after `clientPrivateKeyPem`, for the same reason `bodyStreamId` could not
+/// in v4. Nothing else moved: no signature changed and no symbol was added,
+/// so the only skew a mismatched pairing produces is reading one field past
+/// the end of its own struct.
+const int _expectedAbiVersion = 6;
 
 /// Verifies the native library speaks this package's C ABI, and returns it.
 ///
@@ -2209,6 +2224,8 @@ class _NativeConfig {
     customRootCaPem.writeTo(ref.customRootCaPem);
     clientCertificatePem.writeTo(ref.clientCertificatePem);
     clientPrivateKeyPem.writeTo(ref.clientPrivateKeyPem);
+    ref.inactivityTimeoutSeconds =
+        config['inactivityTimeoutSeconds'] as int? ?? -1;
   }
 
   final Pointer<_VaneFfiClientConfig> pointer;

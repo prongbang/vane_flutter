@@ -88,6 +88,7 @@ class VaneConfiguration {
     this.tlsMaxVersion,
     this.customRootCertificates = const <String>[],
     this.clientCertificate,
+    this.inactivityTimeoutSeconds,
   });
 
   final String? baseUrl;
@@ -128,6 +129,19 @@ class VaneConfiguration {
   /// Client identity for mutual TLS.
   final VaneClientCertificate? clientCertificate;
 
+  /// Bounds an HTTP/3 request by time without forward progress instead of by
+  /// total duration, so an upload or download larger than [timeoutSeconds]
+  /// can move as long as it keeps moving.
+  ///
+  /// This replaces the absolute deadline rather than adding to it: with it
+  /// set, nothing caps a request's total duration and a peer willing to
+  /// dribble bytes can hold one open. QUIC's idle timeout, armed from the
+  /// same value, still kills a peer that goes entirely silent.
+  ///
+  /// HTTP/3 only. The TCP path cannot observe upload progress to reset
+  /// against and stays on [timeoutSeconds].
+  final int? inactivityTimeoutSeconds;
+
   Map<String, Object?> toMap() {
     return <String, Object?>{
       'baseUrl': baseUrl,
@@ -161,6 +175,7 @@ class VaneConfiguration {
               'certificatePem': clientCertificate!.certificatePem,
               'privateKeyPem': clientCertificate!.privateKeyPem,
             },
+      'inactivityTimeoutSeconds': inactivityTimeoutSeconds,
     };
   }
 }

@@ -182,6 +182,26 @@ void main() {
     VaneFlutterPlatform.instance = initialPlatform;
   });
 
+  /// The v6 knob. A wire key is the whole contract here: misspell it and the
+  /// map still serializes, the native side still starts, and the knob simply
+  /// never takes effect — a silent no-op rather than an error.
+  test('configuration toMap carries the v6 inactivity knob', () async {
+    final fakePlatform = MockVaneFlutterPlatform();
+    VaneFlutterPlatform.instance = fakePlatform;
+
+    await VaneClient().get('/defaults');
+    expect(
+      fakePlatform.lastConfiguration?['inactivityTimeoutSeconds'],
+      isNull,
+      reason: 'unset by default, which is what keeps the absolute deadline',
+    );
+
+    await VaneClient(
+      configuration: const VaneConfiguration(inactivityTimeoutSeconds: 15),
+    ).get('/knob');
+    expect(fakePlatform.lastConfiguration?['inactivityTimeoutSeconds'], 15);
+  });
+
   test('configuration toMap carries the v5 knobs to the platform', () async {
     final fakePlatform = MockVaneFlutterPlatform();
     VaneFlutterPlatform.instance = fakePlatform;
